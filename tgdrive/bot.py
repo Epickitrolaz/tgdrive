@@ -7,6 +7,7 @@ API_BASE = "https://api.telegram.org/bot{token}/{method}"
 FILE_BASE = "https://api.telegram.org/file/bot{token}/{file_path}"
 CHUNK_SIZE = 20 * 1024 * 1024
 CAPTION_PREFIX = "TGDRIVE:v1:"
+IDX_PREFIX = "TGDRIVE_IDX:v1\n"
 REQUEST_TIMEOUT = 600
 
 log = logging.getLogger(__name__)
@@ -18,11 +19,10 @@ class TgBot:
         self.chat_id = str(chat_id)
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "tgdrive/2.0"
-        self._offset = 0
 
     def _call(self, method, data=None, files=None, params=None):
         url = API_BASE.format(token=self.token, method=method)
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 r = self.session.post(
                     url, data=data, files=files, params=params,
@@ -36,10 +36,29 @@ class TgBot:
                         raise MessageNotFoundError(desc)
                     if "message to delete not found" in desc:
                         raise MessageNotFoundError(desc)
+                    if "retry after" in desc:
+                        wait = 2 ** attempt
+                        log.warning(
+                            "Rate limited on %s, retry %d in %ds",
+                            method, attempt + 1, wait,
+                        )
+                        time.sleep(wait)
+                        continue
                     raise Exception(f"API error: {desc}")
                 return result["result"]
+            except requests.HTTPError as e:
+                status = e.response.status_code
+                if status == 429:
+                    wait = 2 ** attempt
+                    log.warning(
+                        "HTTP 429 on %s, retry %d in %ds",
+                        method, attempt + 1, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
             except (requests.Timeout, requests.ConnectionError) as e:
-                if attempt == 2:
+                if attempt == 4:
                     raise
                 log.warning("Retry %d for %s: %s", attempt + 1, method, e)
                 time.sleep(2 ** attempt)
@@ -103,28 +122,55 @@ class TgBot:
                 time.sleep(2 ** attempt)
         raise Exception(f"Download failed for {file_path}")
 
-    def get_updates(self, timeout=30):
-        params = {
-            "offset": self._offset,
-            "timeout": timeout,
-            "allowed_updates": json.dumps(["message"]),
-        }
-        try:
-            result = self._call("getUpdates", params=params)
-            if result:
-                for u in result:
-                    self._offset = u["update_id"] + 1
-                return result
-        except Exception:
-            pass
-        return []
-
     def upload_chunk(self, data, filename, caption):
         return self.send_document(data, filename, caption)
 
     def download_chunk_data(self, file_id):
         info = self.get_file(file_id)
         return self.download_file(info["file_path"])
+
+    def pin_message(self, msg_id):
+        return self._call(
+            "pinChatMessage",
+            data={"chat_id": self.chat_id, "message_id": msg_id},
+        )
+
+    def get_pinned_index(self):
+        chat = self._call("getChat", data={"chat_id": self.chat_id})
+        pm = chat.get("pinned_message")
+        if not pm:
+            return None, None, None
+        text = pm.get("text", "")
+        if not text.startswith(IDX_PREFIX):
+            return None, None, None
+        try:
+            wrapper = json.loads(text[len(IDX_PREFIX):])
+            gen = wrapper.get("gen", 0)
+            files = wrapper.get("files", wrapper)
+            return pm["message_id"], gen, files
+        except (json.JSONDecodeError, KeyError):
+            return None, None, None
+
+    def create_pinned_index(self, data):
+        wrapper = {"files": data, "gen": 1}
+        text = IDX_PREFIX + json.dumps(wrapper, separators=(",", ":"))
+        msg = self.send_message(text)
+        self.pin_message(msg["message_id"])
+        return msg["message_id"]
+
+    def update_pinned_index(self, old_msg_id, gen, files):
+        wrapper = {"files": files, "gen": gen}
+        text = IDX_PREFIX + json.dumps(wrapper, separators=(",", ":"))
+        if old_msg_id is not None:
+            try:
+                msg = self.edit_message_text(old_msg_id, text)
+                return msg["message_id"]
+            except MessageNotFoundError:
+                pass
+        msg = self.send_message(text)
+        new_msg_id = msg["message_id"]
+        self.pin_message(new_msg_id)
+        return new_msg_id
 
     def get_chat(self):
         return self._call("getChat", data={"chat_id": self.chat_id})

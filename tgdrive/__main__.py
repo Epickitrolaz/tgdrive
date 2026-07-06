@@ -19,14 +19,6 @@ def main():
         help="Telegram channel/chat ID (or TGDRIVE_CHAT_ID env var)"
     )
     parser.add_argument(
-        "--cache-dir",
-        default=os.environ.get(
-            "TGDRIVE_CACHE_DIR",
-            os.path.join(os.path.expanduser("~"), ".cache", "tgdrive"),
-        ),
-        help="Cache directory for local state and chunks",
-    )
-    parser.add_argument(
         "--foreground", action="store_true",
         help="Run in foreground (don't daemonize)"
     )
@@ -57,9 +49,7 @@ def main():
     log = logging.getLogger("tgdrive")
     log.info("Mounting Telegram Drive on %s", args.mountpoint)
     log.info("Chat ID: %s", args.chat_id)
-    log.info("Cache dir: %s", args.cache_dir)
 
-    os.makedirs(args.cache_dir, exist_ok=True)
     if not os.path.isdir(args.mountpoint):
         os.makedirs(args.mountpoint, exist_ok=True)
 
@@ -68,7 +58,6 @@ def main():
     fs = TgDriveFS(
         token=args.token,
         chat_id=args.chat_id,
-        cache_dir=os.path.join(args.cache_dir, str(args.chat_id)),
     )
 
     fuse_kwargs = {
