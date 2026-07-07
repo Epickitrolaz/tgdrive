@@ -8,6 +8,7 @@ FILE_BASE = "https://api.telegram.org/file/bot{token}/{file_path}"
 CHUNK_SIZE = 20 * 1024 * 1024
 CAPTION_PREFIX = "TGDRIVE:v1:"
 IDX_PREFIX = "TGDRIVE_IDX:v1\n"
+IDX_FILE_PREFIX = "TGDRIVE_IDX_FILE:v1\n"
 REQUEST_TIMEOUT = 600
 
 log = logging.getLogger(__name__)
@@ -135,42 +136,67 @@ class TgBot:
             data={"chat_id": self.chat_id, "message_id": msg_id},
         )
 
-    def get_pinned_index(self):
+    def get_index_file(self):
         chat = self._call("getChat", data={"chat_id": self.chat_id})
         pm = chat.get("pinned_message")
         if not pm:
-            return None, None, None
+            return None, None, None, None, None
         text = pm.get("text", "")
-        if not text.startswith(IDX_PREFIX):
-            return None, None, None
-        try:
-            wrapper = json.loads(text[len(IDX_PREFIX):])
-            gen = wrapper.get("gen", 0)
-            files = wrapper.get("files", wrapper)
-            return pm["message_id"], gen, files
-        except (json.JSONDecodeError, KeyError):
-            return None, None, None
-
-    def create_pinned_index(self, data):
-        wrapper = {"files": data, "gen": 1}
-        text = IDX_PREFIX + json.dumps(wrapper, separators=(",", ":"))
-        msg = self.send_message(text)
-        self.pin_message(msg["message_id"])
-        return msg["message_id"]
-
-    def update_pinned_index(self, old_msg_id, gen, files):
-        wrapper = {"files": files, "gen": gen}
-        text = IDX_PREFIX + json.dumps(wrapper, separators=(",", ":"))
-        if old_msg_id is not None:
+        if text.startswith(IDX_FILE_PREFIX):
             try:
-                msg = self.edit_message_text(old_msg_id, text)
-                return msg["message_id"]
+                ref = json.loads(text[len(IDX_FILE_PREFIX):])
+                gen = ref.get("gen", 0)
+                file_id = ref.get("file_id")
+                if not file_id:
+                    return None, None, None, None, None
+                data = self.download_chunk_data(file_id)
+                files = json.loads(data.decode("utf-8"))
+                return pm["message_id"], file_id, ref.get("msg_id"), gen, files
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return None, None, None, None, None
+        elif text.startswith(IDX_PREFIX):
+            try:
+                wrapper = json.loads(text[len(IDX_PREFIX):])
+                gen = wrapper.get("gen", 0)
+                files = wrapper.get("files", wrapper)
+                return pm["message_id"], None, None, gen, files
+            except (json.JSONDecodeError, KeyError):
+                return None, None, None, None, None
+        return None, None, None, None, None
+
+    def create_index_file(self, data):
+        payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        msg = self.send_document(payload, "index.json")
+        ref = {
+            "msg_id": msg["message_id"],
+            "file_id": msg["document"]["file_id"],
+            "gen": 1,
+        }
+        text = IDX_FILE_PREFIX + json.dumps(ref, separators=(",", ":"))
+        pin_msg = self.send_message(text)
+        self.pin_message(pin_msg["message_id"])
+        return pin_msg["message_id"], msg["document"]["file_id"], msg["message_id"]
+
+    def update_index_file(self, old_pin_msg_id, old_doc_msg_id, gen, files):
+        payload = json.dumps(files, separators=(",", ":")).encode("utf-8")
+        msg = self.send_document(payload, "index.json")
+        new_doc_msg_id = msg["message_id"]
+        new_file_id = msg["document"]["file_id"]
+        ref = {"msg_id": new_doc_msg_id, "file_id": new_file_id, "gen": gen}
+        text = IDX_FILE_PREFIX + json.dumps(ref, separators=(",", ":"))
+        if old_pin_msg_id is not None:
+            try:
+                pin_msg = self.edit_message_text(old_pin_msg_id, text)
+                if old_doc_msg_id is not None:
+                    self.delete_message(old_doc_msg_id)
+                return pin_msg["message_id"], new_file_id, new_doc_msg_id
             except MessageNotFoundError:
                 pass
-        msg = self.send_message(text)
-        new_msg_id = msg["message_id"]
-        self.pin_message(new_msg_id)
-        return new_msg_id
+        pin_msg = self.send_message(text)
+        self.pin_message(pin_msg["message_id"])
+        if old_doc_msg_id is not None:
+            self.delete_message(old_doc_msg_id)
+        return pin_msg["message_id"], new_file_id, new_doc_msg_id
 
     def get_chat(self):
         return self._call("getChat", data={"chat_id": self.chat_id})
@@ -223,4 +249,3 @@ class TgBot:
 
 class MessageNotFoundError(Exception):
     pass
-
