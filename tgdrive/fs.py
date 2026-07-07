@@ -1,438 +1,697 @@
+"""FUSE filesystem backed by a Telegram chat.
+
+Files are stored as Telegram document messages (20 MB chunks) and a JSON
+directory index is kept in the chat's pinned message. Written data is buffered
+in memory and only uploaded on flush()/fsync(); release() does NOT flush.
+"""
+
+from __future__ import annotations
+
+import errno
+import json
 import logging
 import os
 import stat
 import threading
 import time
 import uuid
-from collections import OrderedDict
-from errno import ENOENT, EBADF, EACCES, EEXIST, ENOTEMPTY, ENOTDIR
+from typing import Any
 
-from fuse import FuseOSError, Operations, LoggingMixIn
+from fuse import FUSE, FuseOSError, Operations
 
-from .bot import TgBot, CHUNK_SIZE
+from .telegram import TelegramClient
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("tgdrive.fs")
 
-POLL_INTERVAL = 5
+DIR_MODE = 0o755
+FILE_MODE = 0o644
+ROOT_PATH = "/"
+POLL_INTERVAL = 5.0
 
 
-class TgDriveFS(LoggingMixIn, Operations):
-    def __init__(self, token, chat_id, foreground=False):
-        self.bot = TgBot(token, chat_id)
-        self._idx_msg_id = None
-        self._idx_file_id = None
-        self._idx_doc_msg_id = None
-        self._idx_data = OrderedDict()
-        self._idx_gen = 0
-        self._fd_map = {}
-        self._next_fd = 1
-        self._mutex = threading.RLock()
-        self._running = True
+def _norm(path: str) -> str:
+    if not path or path == ROOT_PATH:
+        return ROOT_PATH
+    # Collapse duplicate/trailing slashes.
+    parts = [p for p in path.split("/") if p]
+    return ROOT_PATH + "/".join(parts)
 
-        self._init_index()
 
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True
-        )
-        self._poll_thread.start()
+def _now() -> float:
+    return time.time()
 
-        log.info(
-            "Filesystem initialized with %d entries", len(self._idx_data)
-        )
 
-    def _init_index(self):
-        msg_id, file_id, doc_msg_id, gen, data = self.bot.get_index_file()
-        if msg_id is not None:
-            with self._mutex:
-                self._idx_msg_id = msg_id
-                self._idx_file_id = file_id
-                self._idx_doc_msg_id = doc_msg_id
-                self._idx_gen = gen
-                self._idx_data = OrderedDict(data)
-            log.info("Loaded directory index from file %s", file_id)
-        else:
-            with self._mutex:
-                msg_id, file_id, doc_msg_id = self.bot.create_index_file({})
-                self._idx_msg_id = msg_id
-                self._idx_file_id = file_id
-                self._idx_doc_msg_id = doc_msg_id
-                self._idx_data = OrderedDict()
-            log.info("Created new empty directory index file")
+class _Handle:
+    """An open file handle.
 
-    def _replace_index(self):
-        with self._mutex:
-            old_msg_id = self._idx_msg_id
-            old_doc_msg_id = self._idx_doc_msg_id
-            self._idx_gen += 1
+    Holds an in-memory buffer that is the single source of truth for this
+    handle: for read-only handles it is filled once (lazily) from Telegram and
+    reused for every read(); for writable handles it accumulates writes until
+    flush(). Nothing is ever written to disk — this is purely an in-memory,
+    per-handle cache.
+    """
+
+    __slots__ = (
+        "fh",
+        "path",
+        "buffer",
+        "loaded",
+        "dirty",
+        "flushed_chunks",
+        "uuid",
+        "start_empty",
+        "write_mode",
+    )
+
+    def __init__(self, fh: int, path: str, start_empty: bool = False, write_mode: bool = False):
+        self.fh = fh
+        self.path = path
+        self.buffer = bytearray()
+        self.loaded = False
+        self.dirty = False
+        self.flushed_chunks: list[dict[str, Any]] | None = None
+        self.uuid = uuid.uuid4().hex
+        self.start_empty = start_empty
+        self.write_mode = write_mode
+
+
+class TgDriveFS(Operations):
+    """A FUSE filesystem mapping a Telegram chat to a virtual drive."""
+
+    def __init__(self, token: str, chat_id: str | int, chunk_size: int | None = None):
+        kwargs: dict[str, Any] = {}
+        if chunk_size:
+            kwargs["chunk_size"] = chunk_size
+        self.tg = TelegramClient(token, chat_id, **kwargs)
+        self.entries: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._handles: dict[int, _Handle] = {}
+        self._next_fh = 1
+        self._fh_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._fingerprint: str = ""
+        self._uid = os.getuid()
+        self._gid = os.getgid()
+        # Load initial index.
+        self._load_index()
+        # Start background poller.
+        self._poller = threading.Thread(target=self._poll_loop, daemon=True, name="tgdrive-poll")
+        self._poller.start()
+
+    # -- index (de)serialization -------------------------------------------
+    def _empty_index(self) -> dict[str, Any]:
+        return {"version": 1, "entries": {}}
+
+    def _load_index(self) -> None:
+        with self._lock:
             try:
-                self._idx_msg_id, self._idx_file_id, self._idx_doc_msg_id = \
-                    self.bot.update_index_file(
-                        old_msg_id, old_doc_msg_id, self._idx_gen,
-                        dict(self._idx_data)
-                    )
-            except Exception:
-                log.warning("Failed to update directory index", exc_info=True)
-
-    def _poll_loop(self):
-        while self._running:
-            time.sleep(POLL_INTERVAL)
-            try:
-                msg_id, file_id, doc_msg_id, gen, data = \
-                    self.bot.get_index_file()
-                if msg_id is None:
-                    continue
-                with self._mutex:
-                    if gen > self._idx_gen:
-                        self._idx_gen = gen
-                        self._idx_msg_id = msg_id
-                        self._idx_file_id = file_id
-                        self._idx_doc_msg_id = doc_msg_id
-                        self._idx_data = OrderedDict(data)
-                        log.info(
-                            "Directory index updated from file %s (gen %d)",
-                            file_id, gen,
-                        )
+                idx = self.tg.read_pinned_index()
             except Exception as e:
-                log.debug("Poll error: %s", e)
+                log.error("failed to load index: %s", e)
+                idx = None
+            if not isinstance(idx, dict) or "entries" not in idx:
+                self.entries = {}
+            else:
+                self.entries = {str(k): dict(v) for k, v in idx.get("entries", {}).items()}
+            self._fingerprint = self._compute_fingerprint()
+            log.debug("loaded index with %d entries", len(self.entries))
 
-    def _is_dir(self, path):
-        if path in self._idx_data:
-            return stat.S_ISDIR(self._idx_data[path]["mode"])
-        prefix = path + "/"
-        return any(k.startswith(prefix) for k in self._idx_data)
+    def _compute_fingerprint(self) -> str:
+        try:
+            meta = self.tg.get_pinned_meta()
+        except Exception:
+            meta = None
+        if meta is None:
+            return ""
+        return json.dumps(meta, sort_keys=True, separators=(",", ":"))
 
-    def getattr(self, path, fh=None):
-        stripped = path.lstrip("/")
-        if not stripped:
-            now = time.time()
-            uid = os.getuid()
-            gid = os.getgid()
-            return {
-                "st_mode": stat.S_IFDIR | 0o755,
-                "st_nlink": 2,
-                "st_size": 4096,
-                "st_ctime": now,
-                "st_mtime": now,
-                "st_atime": now,
-                "st_uid": uid,
-                "st_gid": gid,
-            }
-        with self._mutex:
-            meta = self._idx_data.get(stripped)
-            if meta:
-                return {
-                    "st_mode": meta["mode"],
-                    "st_nlink": 1 if stat.S_ISREG(meta["mode"]) else 2,
-                    "st_size": meta.get("size", 4096),
-                    "st_ctime": meta["mtime"],
-                    "st_mtime": meta["mtime"],
-                    "st_atime": meta["mtime"],
-                    "st_uid": os.getuid(),
-                    "st_gid": os.getgid(),
-                }
-            if self._is_dir(stripped):
-                now = time.time()
-                return {
-                    "st_mode": stat.S_IFDIR | 0o755,
-                    "st_nlink": 2,
-                    "st_size": 4096,
-                    "st_ctime": now,
-                    "st_mtime": now,
-                    "st_atime": now,
-                    "st_uid": os.getuid(),
-                    "st_gid": os.getgid(),
-                }
-        raise FuseOSError(ENOENT)
+    def _index_dict(self) -> dict[str, Any]:
+        return {"version": 1, "entries": self.entries}
 
-    def readdir(self, path, fh):
-        stripped = path.lstrip("/")
-        entries = [".", ".."]
-        prefix = (stripped + "/") if stripped else ""
-        seen = set()
-        with self._mutex:
-            if stripped and not self._is_dir(stripped):
-                raise FuseOSError(ENOENT)
-            for key in self._idx_data:
-                if not key.startswith(prefix):
-                    continue
-                rest = key[len(prefix):]
-                if "/" in rest:
-                    subdir = rest.split("/", 1)[0]
-                    if subdir not in seen:
-                        seen.add(subdir)
-                        entries.append(subdir)
-                elif rest:
-                    if rest not in seen:
-                        seen.add(rest)
-                        entries.append(rest)
-        return entries
+    def _persist(self) -> None:
+        with self._lock:
+            idx = self._index_dict()
+            try:
+                meta = self.tg.write_index(idx)
+            except Exception as e:
+                log.exception("failed to persist index (entries=%d): %s", len(self.entries), e)
+                raise FuseOSError(errno.EIO)
+            self._fingerprint = json.dumps(meta, sort_keys=True, separators=(",", ":"))
 
-    def open(self, path, flags):
-        filename = path.lstrip("/")
-        with self._mutex:
-            meta = self._idx_data.get(filename)
-            if not meta:
-                raise FuseOSError(ENOENT)
-            if stat.S_ISDIR(meta["mode"]):
-                raise FuseOSError(EACCES)
-            fd = self._next_fd
-            self._next_fd += 1
-            writable = bool(flags & (os.O_WRONLY | os.O_RDWR))
-            self._fd_map[fd] = {
-                "filename": filename,
-                "parts": list(meta.get("parts", [])),
-                "file_size": meta["size"],
-                "chunks": {},
-            }
-            if writable:
-                self._fd_map[fd]["buffer"] = bytearray()
-                self._fd_map[fd]["dirty"] = False
-        return fd
+    # -- poller ------------------------------------------------------------
+    def _poll_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                remote_fp = self._compute_fingerprint()
+                if remote_fp and remote_fp != self._fingerprint:
+                    # Our own persist may have raced with this fetch and already
+                    # updated the fingerprint; re-check before reloading to avoid
+                    # a spurious (and potentially clobbering) reload.
+                    if remote_fp != self._fingerprint:
+                        log.info("detected remote index change, reloading")
+                        self._load_index()
+            except Exception as e:
+                log.debug("poll error: %s", e)
+            self._stop.wait(POLL_INTERVAL)
 
-    def read(self, path, size, offset, fh):
-        with self._mutex:
-            h = self._fd_map.get(fh)
-            if not h:
-                raise FuseOSError(EBADF)
-            parts = h["parts"]
-            chunks = h["chunks"]
-            file_size = h["file_size"]
+    def destroy(self, path: str | None = None) -> None:
+        self._stop.set()
 
-        if offset >= file_size:
-            return b""
+    # -- handle helpers ----------------------------------------------------
+    def _new_fh(self, path: str, start_empty: bool = False, write_mode: bool = False) -> int:
+        with self._fh_lock:
+            fh = self._next_fh
+            self._next_fh += 1
+            self._handles[fh] = _Handle(fh, path, start_empty=start_empty, write_mode=write_mode)
+            return fh
 
-        result = bytearray()
-        while size > 0 and offset < file_size:
-            part_idx = offset // CHUNK_SIZE
-            if part_idx >= len(parts) or parts[part_idx] is None:
-                break
-            if part_idx not in chunks:
-                chunks[part_idx] = self.bot.download_chunk_data(
-                    parts[part_idx]["file_id"]
+    def _get_handle(self, fh: int) -> _Handle:
+        h = self._handles.get(fh)
+        if h is None:
+            raise FuseOSError(errno.EBADF)
+        return h
+
+    def _ensure_loaded(self, h: _Handle) -> None:
+        """Populate the handle's buffer from Telegram exactly once.
+
+        After the first call the buffer is reused for all subsequent reads on
+        this handle, so a 100 MB file is downloaded a single time per open()
+        instead of once per 128 KB read.
+        """
+        if h.loaded or h.dirty:
+            return
+        with self._lock:
+            entry = self.entries.get(h.path)
+            chunks = list(entry.get("chunks", [])) if entry else []
+        if h.start_empty or not chunks:
+            h.buffer = bytearray()
+            h.loaded = True
+            return
+        size = int(entry.get("size", sum(int(c.get("size", 0)) for c in chunks))) if entry else 0
+        log.info(
+            "downloading %d chunk(s) (%.2f MB) for %s",
+            len(chunks),
+            size / 1e6,
+            h.path,
+        )
+        t0 = time.time()
+        last_pct = [-1]
+
+        def on_progress(done: int, total: int, bytes_done: int, bytes_total: int) -> None:
+            if total:
+                pct = int(done * 100 / total)
+            else:
+                pct = 100
+            if pct != last_pct[0] and pct % 10 == 0:
+                last_pct[0] = pct
+                rate = bytes_done / (time.time() - t0) / 1e6 if time.time() > t0 else 0
+                log.info(
+                    "  download %s: %d/%d chunks (%d%%, %.2f MB/s)",
+                    h.path,
+                    done,
+                    total,
+                    pct,
+                    rate,
                 )
-            chunk_data = chunks[part_idx]
-            chunk_off = offset % CHUNK_SIZE
-            available = min(size, len(chunk_data) - chunk_off)
-            result.extend(
-                chunk_data[chunk_off : chunk_off + available]
-            )
-            offset += available
-            size -= available
 
-        return bytes(result)
-
-    def create(self, path, mode, fi=None):
-        filename = path.lstrip("/")
-        file_uuid = str(uuid.uuid4())
-        with self._mutex:
-            if filename in self._idx_data:
-                raise FuseOSError(EEXIST)
-            parent = filename.rsplit("/", 1)[0] if "/" in filename else ""
-            if parent and not self._is_dir(parent):
-                raise FuseOSError(ENOENT)
-            self._idx_data[filename] = {
-                "uuid": file_uuid,
-                "size": 0,
-                "mtime": time.time(),
-                "mode": stat.S_IFREG | (mode & 0o7777),
-                "parts": [],
-            }
-            fd = self._next_fd
-            self._next_fd += 1
-            self._fd_map[fd] = {
-                "filename": filename,
-                "buffer": bytearray(),
-                "dirty": False,
-            }
-        return fd
-
-    def write(self, path, data, offset, fh):
-        with self._mutex:
-            h = self._fd_map.get(fh)
-            if not h or "buffer" not in h:
-                raise FuseOSError(EBADF)
-            h["dirty"] = True
-            buf = h["buffer"]
-            needed = offset + len(data)
-            if needed > len(buf):
-                buf.extend(b"\x00" * (needed - len(buf)))
-            buf[offset : offset + len(data)] = data
-            return len(data)
-
-    def truncate(self, path, length, fh=None):
-        filename = path.lstrip("/")
-        with self._mutex:
-            meta = self._idx_data.get(filename)
-            if not meta:
-                raise FuseOSError(ENOENT)
-            if fh is not None and fh in self._fd_map:
-                h = self._fd_map[fh]
-                if "buffer" in h:
-                    buf = h["buffer"]
-                    if length < len(buf):
-                        h["buffer"] = buf[:length]
-                    elif length > len(buf):
-                        h["buffer"].extend(
-                            b"\x00" * (length - len(buf))
-                        )
-                    h["dirty"] = True
-            meta["size"] = length
-            meta["mtime"] = time.time()
-
-    def flush(self, path, fh):
-        with self._mutex:
-            h = self._fd_map.get(fh)
-            if not h or not h.get("dirty"):
-                return
-            filename = h["filename"]
-            meta = self._idx_data.get(filename)
-            if not meta:
-                return
-            data = bytes(h["buffer"])
-
-        for part in meta.get("parts", []):
-            if part is not None:
-                try:
-                    self.bot.delete_message(part["msg_id"])
-                except Exception:
-                    pass
-
-        new_parts = self.bot.upload_file_chunks(
-            meta["uuid"], data, filename, meta["mode"], time.time()
+        try:
+            data = self.tg.download_chunks(chunks, on_progress=on_progress)
+        except Exception as e:
+            log.error("download failed for %s: %s", h.path, e)
+            raise FuseOSError(errno.EIO)
+        h.buffer = bytearray(data)
+        h.loaded = True
+        elapsed = time.time() - t0
+        rate = len(data) / elapsed / 1e6 if elapsed > 0 else 0.0
+        log.info(
+            "downloaded %s (%d bytes) in %.2fs (%.2f MB/s)",
+            h.path,
+            len(data),
+            elapsed,
+            rate,
         )
 
-        with self._mutex:
-            if filename in self._idx_data:
-                meta = self._idx_data[filename]
-                meta["parts"] = new_parts
-                meta["size"] = len(data)
-                meta["mtime"] = time.time()
-                self._replace_index()
+    # -- attribute helpers -------------------------------------------------
+    def _entry_for(self, path: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self.entries.get(path)
 
-        h["dirty"] = False
+    def _is_implicit_dir(self, path: str) -> bool:
+        if path == ROOT_PATH:
+            return True
+        prefix = path + "/"
+        with self._lock:
+            for k in self.entries:
+                if k.startswith(prefix):
+                    return True
+        return False
 
-    def release(self, path, fh):
-        with self._mutex:
-            self._fd_map.pop(fh, None)
-
-    def unlink(self, path):
-        filename = path.lstrip("/")
-        with self._mutex:
-            meta = self._idx_data.pop(filename, None)
-            if not meta:
-                raise FuseOSError(ENOENT)
-
-        for part in meta.get("parts", []):
-            if part is not None:
-                try:
-                    self.bot.delete_message(part["msg_id"])
-                except Exception:
-                    pass
-
-        with self._mutex:
-            self._replace_index()
-
-    def rename(self, old, new):
-        old_name = old.lstrip("/")
-        new_name = new.lstrip("/")
-        with self._mutex:
-            if old_name not in self._idx_data:
-                raise FuseOSError(ENOENT)
-            meta = self._idx_data.pop(old_name)
-            meta["mtime"] = time.time()
-            self._idx_data[new_name] = meta
-            if stat.S_ISDIR(meta["mode"]):
-                prefix = old_name + "/"
-                to_move = [k for k in self._idx_data if k.startswith(prefix)]
-                for k in to_move:
-                    v = self._idx_data.pop(k)
-                    self._idx_data[new_name + k[len(old_name):]] = v
-            self._replace_index()
-
-    def utimens(self, path, times):
-        filename = path.lstrip("/")
-        with self._mutex:
-            if filename in self._idx_data:
-                if times:
-                    self._idx_data[filename]["mtime"] = times[1]
-                else:
-                    self._idx_data[filename]["mtime"] = time.time()
-                self._replace_index()
-
-    def chmod(self, path, mode):
-        filename = path.lstrip("/")
-        with self._mutex:
-            if filename in self._idx_data:
-                self._idx_data[filename]["mode"] = (
-                    stat.S_IFREG | (mode & 0o7777)
-                )
-                self._replace_index()
-
-    def mkdir(self, path, mode):
-        stripped = path.lstrip("/")
-        if not stripped:
-            raise FuseOSError(EEXIST)
-        with self._mutex:
-            if stripped in self._idx_data:
-                raise FuseOSError(EEXIST)
-            parent = stripped.rsplit("/", 1)[0] if "/" in stripped else ""
-            if parent and not self._is_dir(parent):
-                raise FuseOSError(ENOENT)
-            self._idx_data[stripped] = {
-                "mode": stat.S_IFDIR | (mode & 0o7777),
-                "mtime": time.time(),
-                "size": 4096,
-            }
-            self._replace_index()
-
-    def rmdir(self, path):
-        stripped = path.lstrip("/")
-        if not stripped:
-            raise FuseOSError(EEXIST)
-        with self._mutex:
-            meta = self._idx_data.get(stripped)
-            if not meta:
-                raise FuseOSError(ENOENT)
-            if not stat.S_ISDIR(meta["mode"]):
-                raise FuseOSError(ENOTDIR)
-            prefix = stripped + "/"
-            for key in self._idx_data:
-                if key.startswith(prefix):
-                    raise FuseOSError(ENOTEMPTY)
-            del self._idx_data[stripped]
-            self._replace_index()
-
-    def chown(self, path, uid, gid):
-        pass
-
-    def statfs(self, path):
+    def _dir_attr(self, mtime: float | None = None) -> dict[str, Any]:
         return {
-            "f_bsize": 512,
-            "f_blocks": 4000000,
-            "f_bfree": 4000000,
-            "f_bavail": 4000000,
-            "f_files": 100000,
-            "f_ffree": 100000,
-            "f_favail": 100000,
-            "f_namemax": 255,
+            "st_mode": stat.S_IFDIR | DIR_MODE,
+            "st_nlink": 2,
+            "st_size": 4096,
+            "st_mtime": mtime or _now(),
+            "st_atime": mtime or _now(),
+            "st_ctime": mtime or _now(),
+            "st_uid": self._uid,
+            "st_gid": self._gid,
         }
 
-    def destroy(self, private_data):
-        self._running = False
+    def _file_attr(self, entry: dict[str, Any]) -> dict[str, Any]:
+        mode = entry.get("mode", FILE_MODE)
+        size = int(entry.get("size", 0))
+        mtime = float(entry.get("mtime", _now()))
+        atime = float(entry.get("atime", mtime))
+        return {
+            "st_mode": (stat.S_IFREG | (mode & 0o7777)) if not stat.S_ISREG(mode) else mode,
+            "st_nlink": 1,
+            "st_size": size,
+            "st_mtime": mtime,
+            "st_atime": atime,
+            "st_ctime": mtime,
+            "st_uid": int(entry.get("uid", self._uid)),
+            "st_gid": int(entry.get("gid", self._gid)),
+        }
 
-    def lock(self, path, fh, cmd, lock):
+    def _resolve_attr(self, path: str) -> dict[str, Any]:
+        if path == ROOT_PATH:
+            return self._dir_attr(_now())
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is not None:
+                if entry.get("type") == "dir":
+                    return self._dir_attr(float(entry.get("mtime", _now())))
+                return self._file_attr(entry)
+        if self._is_implicit_dir(path):
+            return self._dir_attr(_now())
+        raise FuseOSError(errno.ENOENT)
+
+    # -- FUSE operations ---------------------------------------------------
+    def getattr(self, path: str, fh: int | None = None) -> dict[str, Any]:
+        path = _norm(path)
+        return self._resolve_attr(path)
+
+    def readdir(self, path: str, fh: int | None = None) -> list[str]:
+        path = _norm(path)
+        names = {".", ".."}
+        prefix = ROOT_PATH if path == ROOT_PATH else path + "/"
+        plen = len(prefix)
+        with self._lock:
+            for k in self.entries:
+                if path != ROOT_PATH and not k.startswith(prefix):
+                    continue
+                rest = k[plen:]
+                if not rest:
+                    continue
+                child = rest.split("/", 1)[0]
+                names.add(child)
+        return list(names)
+
+    def access(self, path: str, mode: int) -> int:
+        path = _norm(path)
+        try:
+            self._resolve_attr(path)
+        except FuseOSError as e:
+            if mode & os.F_OK and e.errno == errno.ENOENT:
+                raise
+            return 0
         return 0
 
-    def fsync(self, path, datasync, fh):
+    def open(self, path: str, flags: int) -> int:
+        path = _norm(path)
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None or entry.get("type") != "file":
+                raise FuseOSError(errno.ENOENT)
+        start_empty = bool(flags & os.O_TRUNC)
+        write_mode = bool(flags & (os.O_WRONLY | os.O_RDWR))
+        return self._new_fh(path, start_empty=start_empty, write_mode=write_mode)
+
+    def create(self, path: str, mode: int, fi: Any | None = None) -> int:
+        path = _norm(path)
+        now = _now()
+        entry = {
+            "type": "file",
+            "size": 0,
+            "mtime": now,
+            "atime": now,
+            "mode": stat.S_IFREG | (mode & 0o7777),
+            "uid": self._uid,
+            "gid": self._gid,
+            "chunks": [],
+            "uuid": uuid.uuid4().hex,
+        }
+        with self._lock:
+            self.entries[path] = entry
+            self._persist()
+        return self._new_fh(path, start_empty=True, write_mode=True)
+
+    def read(self, path: str, size: int, offset: int, fh: int) -> bytes:
+        path = _norm(path)
+        h = self._get_handle(fh)
+        # Download once per handle (lazy), then serve every read from the
+        # in-memory buffer. Without this, every 128 KB kernel read would
+        # re-download the entire file from Telegram.
+        self._ensure_loaded(h)
+        data = h.buffer
+        if offset >= len(data):
+            return b""
+        return bytes(data[offset : offset + size])
+
+    def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
+        path = _norm(path)
+        h = self._get_handle(fh)
+        # Load existing content so offset-based writes merge correctly (unless
+        # the handle was opened with O_TRUNC / via create(), in which case
+        # _ensure_loaded is a no-op that leaves an empty buffer).
+        self._ensure_loaded(h)
+        with self._lock:
+            # Ensure file entry exists.
+            if path not in self.entries:
+                now = _now()
+                self.entries[path] = {
+                    "type": "file",
+                    "size": 0,
+                    "mtime": now,
+                    "atime": now,
+                    "mode": stat.S_IFREG | FILE_MODE,
+                    "uid": self._uid,
+                    "gid": self._gid,
+                    "chunks": [],
+                    "uuid": h.uuid,
+                }
+            entry = self.entries[path]
+            entry["uuid"] = h.uuid
+        buf = h.buffer
+        end = offset + len(data)
+        if end > len(buf):
+            buf.extend(b"\x00" * (end - len(buf)))
+        buf[offset:end] = data
+        h.dirty = True
+        h.flushed_chunks = None
+        return len(data)
+
+    def flush(self, path: str, fh: int) -> int:
+        path = _norm(path)
+        h = self._get_handle(fh)
+        if not h.dirty:
+            return 0
+        data = bytes(h.buffer)
+        # Delete any previously flushed chunks from this handle.
+        with self._lock:
+            entry = self.entries.get(path)
+            old_chunks = []
+            if entry:
+                old_chunks = list(entry.get("chunks", []))
+        if h.flushed_chunks:
+            old_chunks = h.flushed_chunks
+        if old_chunks:
+            try:
+                self.tg.delete_chunks(old_chunks)
+            except Exception as e:
+                log.warning("could not delete old chunks for %s: %s", path, e)
+        now = _now()
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                entry = {
+                    "type": "file",
+                    "size": 0,
+                    "mtime": now,
+                    "atime": now,
+                    "mode": stat.S_IFREG | FILE_MODE,
+                    "uid": self._uid,
+                    "gid": self._gid,
+                    "chunks": [],
+                    "uuid": h.uuid,
+                }
+                self.entries[path] = entry
+            entry["uuid"] = h.uuid
+            mtime = float(entry.get("mtime", now))
+            mode = int(entry.get("mode", stat.S_IFREG | FILE_MODE))
+        try:
+            chunks = self.tg.upload_chunks(path, data, mtime, mode, h.uuid)
+        except Exception as e:
+            log.error("upload failed for %s: %s", path, e)
+            raise FuseOSError(errno.EIO)
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is not None:
+                entry["chunks"] = chunks
+                entry["size"] = len(data)
+                entry["mtime"] = mtime
+                entry["uuid"] = h.uuid
+            # Persist atomically with the chunk/size update so a poller reload
+            # cannot clobber the just-uploaded file metadata.
+            self._persist()
+        h.dirty = False
+        h.loaded = True
+        h.flushed_chunks = chunks
         return 0
 
-    def access(self, path, amode):
-        stripped = path.lstrip("/")
-        if not stripped:
-            return
-        with self._mutex:
-            if stripped in self._idx_data:
-                return
-            if self._is_dir(stripped):
-                return
-        raise FuseOSError(EACCES)
+    def fsync(self, path: str, datasync: int, fh: int) -> int:
+        return self.flush(path, fh)
+
+    def release(self, path: str, fh: int) -> int:
+        with self._fh_lock:
+            self._handles.pop(fh, None)
+        return 0
+
+    def truncate(self, path: str, length: int, fh: int | None = None) -> int:
+        path = _norm(path)
+        if fh is not None and fh in self._handles:
+            h = self._handles[fh]
+            self._ensure_loaded(h)
+            if length < len(h.buffer):
+                del h.buffer[length:]
+            else:
+                h.buffer.extend(b"\x00" * (length - len(h.buffer)))
+            h.dirty = True
+            h.flushed_chunks = None
+            with self._lock:
+                entry = self.entries.get(path)
+                if entry is not None:
+                    entry["size"] = length
+            return 0
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            chunks = list(entry.get("chunks", []))
+            mtime = float(entry.get("mtime", _now()))
+            mode = int(entry.get("mode", stat.S_IFREG | FILE_MODE))
+            file_uuid = entry.get("uuid", uuid.uuid4().hex)
+        if length == 0:
+            if chunks:
+                try:
+                    self.tg.delete_chunks(chunks)
+                except Exception as e:
+                    log.warning("delete chunks during truncate: %s", e)
+            with self._lock:
+                entry = self.entries.get(path)
+                if entry is not None:
+                    entry["chunks"] = []
+                    entry["size"] = 0
+                    entry["mtime"] = _now()
+                self._persist()
+            return 0
+        try:
+            data = self.tg.download_chunks(chunks) if chunks else b""
+        except Exception as e:
+            log.error("truncate read failed: %s", e)
+            raise FuseOSError(errno.EIO)
+        if length < len(data):
+            data = data[:length]
+        else:
+            data = data + b"\x00" * (length - len(data))
+        if chunks:
+            try:
+                self.tg.delete_chunks(chunks)
+            except Exception:
+                pass
+        try:
+            new_chunks = self.tg.upload_chunks(path, data, mtime, mode, file_uuid)
+        except Exception as e:
+            log.error("truncate upload failed: %s", e)
+            raise FuseOSError(errno.EIO)
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is not None:
+                entry["chunks"] = new_chunks
+                entry["size"] = len(data)
+                entry["mtime"] = _now()
+            self._persist()
+        return 0
+
+    def unlink(self, path: str) -> int:
+        path = _norm(path)
+        with self._lock:
+            entry = self.entries.pop(path, None)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            # Persist atomically with the pop so a poller reload cannot
+            # resurrect the entry between the pop and the persist.
+            self._persist()
+        chunks = entry.get("chunks", [])
+        if chunks:
+            try:
+                self.tg.delete_chunks(chunks)
+            except Exception as e:
+                log.warning("unlink delete chunks: %s", e)
+        return 0
+
+    def rename(self, old: str, new: str) -> int:
+        old = _norm(old)
+        new = _norm(new)
+        with self._lock:
+            entry = self.entries.pop(old, None)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            entry["mtime"] = _now()
+            self.entries[new] = entry
+            # Update any open handles.
+            for h in self._handles.values():
+                if h.path == old:
+                    h.path = new
+            self._persist()
+        return 0
+
+    def mkdir(self, path: str, mode: int) -> int:
+        path = _norm(path)
+        now = _now()
+        with self._lock:
+            if path in self.entries:
+                raise FuseOSError(errno.EEXIST)
+            if not self._is_implicit_dir_parent(path):
+                raise FuseOSError(errno.ENOENT)
+            self.entries[path] = {
+                "type": "dir",
+                "mtime": now,
+                "atime": now,
+                "mode": stat.S_IFDIR | (mode & 0o7777),
+                "uid": self._uid,
+                "gid": self._gid,
+            }
+            self._persist()
+        return 0
+
+    def _is_implicit_dir_parent(self, path: str) -> bool:
+        if path == ROOT_PATH:
+            return True
+        parent = path.rsplit("/", 1)[0] or ROOT_PATH
+        if parent == ROOT_PATH:
+            return True
+        with self._lock:
+            if parent in self.entries:
+                return self.entries[parent].get("type") == "dir"
+        return self._is_implicit_dir(parent)
+
+    def rmdir(self, path: str) -> int:
+        path = _norm(path)
+        prefix = path + "/"
+        with self._lock:
+            if path not in self.entries:
+                # Implicit dir with no explicit entry: nothing to remove.
+                if self._is_implicit_dir(path):
+                    return 0
+                raise FuseOSError(errno.ENOENT)
+            for k in self.entries:
+                if k.startswith(prefix):
+                    raise FuseOSError(errno.ENOTEMPTY)
+            self.entries.pop(path, None)
+            self._persist()
+        return 0
+
+    def utimens(self, path: str, times: tuple[float, float] | None = None) -> int:
+        path = _norm(path)
+        if times is None:
+            atime = mtime = _now()
+        else:
+            atime, mtime = times
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                if self._is_implicit_dir(path):
+                    # Create an explicit dir entry to hold the times.
+                    self.entries[path] = {
+                        "type": "dir",
+                        "mtime": mtime,
+                        "atime": atime,
+                        "mode": stat.S_IFDIR | DIR_MODE,
+                        "uid": self._uid,
+                        "gid": self._gid,
+                    }
+                    self._persist()
+                    return 0
+                raise FuseOSError(errno.ENOENT)
+            entry["atime"] = atime
+            entry["mtime"] = mtime
+            self._persist()
+        return 0
+
+    def chmod(self, path: str, mode: int) -> int:
+        path = _norm(path)
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            if entry.get("type") == "dir":
+                entry["mode"] = stat.S_IFDIR | (mode & 0o7777)
+            else:
+                entry["mode"] = stat.S_IFREG | (mode & 0o7777)
+            self._persist()
+        return 0
+
+    def chown(self, path: str, uid: int, gid: int) -> int:
+        path = _norm(path)
+        with self._lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            if uid != -1:
+                entry["uid"] = uid
+            if gid != -1:
+                entry["gid"] = gid
+            self._persist()
+        return 0
+
+    def statfs(self, path: str) -> dict[str, int]:
+        # Report a generous, fictitious filesystem. Keys must match the
+        # statvfs struct field names (f_-prefixed) used by fusepy.
+        block_size = 20 * 1024 * 1024  # 20 MB blocks (chunk size)
+        total = 50 * 1024 * block_size
+        free = total // 2
+        return {
+            "f_bsize": block_size,
+            "f_frsize": block_size,
+            "f_blocks": total // block_size,
+            "f_bfree": free // block_size,
+            "f_bavail": free // block_size,
+            "f_files": 1000000,
+            "f_ffree": 1000000,
+            "f_favail": 1000000,
+            "f_flag": 0,
+        }
+
+
+def mount(
+    token: str,
+    chat_id: str | int,
+    mountpoint: str,
+    foreground: bool = False,
+    debug: bool = False,
+    chunk_size: int | None = None,
+) -> None:
+    fs = TgDriveFS(token, chat_id, chunk_size=chunk_size)
+    log.info("mounting tgdrive at %s (foreground=%s)", mountpoint, foreground)
+    FUSE(
+        fs,
+        mountpoint,
+        foreground=foreground or debug,
+        nothreads=not debug,
+        debug=debug,
+        allow_root=False,
+        fsname="tgdrive",
+        subtype="tgdrive",
+    )
