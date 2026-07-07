@@ -24,8 +24,10 @@ CHUNK_SIZE = 20 * 1024 * 1024
 API_BASE = "https://api.telegram.org"
 INDEX_MAGIC = "tgdrive"
 INDEX_VERSION = 1
-# A pinned text message may hold at most 4096 characters; keep some headroom.
-MAX_INLINE_INDEX = 3800
+# A pinned text message may hold at most 4096 characters; keep a small margin.
+# Staying below this keeps the index inline (1 API call to edit) instead of
+# spilling to a document (3 API calls), which materially reduces rate limiting.
+MAX_INLINE_INDEX = 4000
 
 
 class TelegramError(Exception):
@@ -52,6 +54,26 @@ class TelegramClient:
     def _file_url(self, file_path: str) -> str:
         return f"{API_BASE}/file/bot{self.token}/{file_path}"
 
+    @staticmethod
+    def _rewind_files(files: dict[str, Any] | None) -> None:
+        """Reset file-like objects so retries send the full body.
+
+        ``requests`` consumes the underlying stream on each POST, so a retry
+        after a rate-limit/5xx would otherwise upload an empty file body
+        (Telegram then returns "Bad Request: file must be non-empty").
+        """
+        if not files:
+            return
+        for value in files.values():
+            items = value if isinstance(value, (tuple, list)) else [value]
+            for item in items:
+                seek = getattr(item, "seek", None)
+                if callable(seek):
+                    try:
+                        seek(0)
+                    except Exception:
+                        pass
+
     def _request(
         self,
         method: str,
@@ -65,6 +87,9 @@ class TelegramClient:
         url = self._api_url(method)
         last_err: Exception | None = None
         for attempt in range(max_retries):
+            # File objects may have been consumed by a previous attempt; rewind
+            # them so every retry sends the complete body.
+            self._rewind_files(files)
             try:
                 resp = self._session.post(
                     url, params=params, files=files, data=data, timeout=timeout
@@ -351,7 +376,19 @@ class TelegramClient:
         uuid: str,
         on_progress=None,
     ) -> list[dict[str, Any]]:
-        """Split data into chunks and upload each as a document. Return chunk metadata."""
+        """Split data into chunks and upload each as a document. Return chunk metadata.
+
+        Uploads are sequential: Telegram's document upload endpoint does not
+        tolerate multiple concurrent large (20 MB) uploads well (it triggers
+        write timeouts), so parallelism here is counterproductive. Sequential
+        uploads also spread requests in time, which is gentler on rate limits
+        than a burst of concurrent sendDocument calls.
+        """
+        # A 0-byte file is represented as an empty chunk list; Telegram rejects
+        # empty document uploads ("file must be non-empty").
+        if len(data) == 0:
+            log.info("uploading %s (0 bytes, 0 chunk(s))", path)
+            return []
         total = max(1, (len(data) + self.chunk_size - 1) // self.chunk_size)
         chunks: list[dict[str, Any]] = []
         offset = 0
@@ -359,25 +396,9 @@ class TelegramClient:
         filename = path.rsplit("/", 1)[-1] or "file"
         log.info("uploading %s (%d bytes, %d chunk(s))", path, len(data), total)
         t0 = time.time()
-        while offset < len(data) or (part == 0 and len(data) == 0):
-            piece = data[offset : offset + self.chunk_size]
-            caption = json.dumps(
-                {
-                    "tgdrive": "chunk",
-                    "v": INDEX_VERSION,
-                    "uuid": uuid,
-                    "part": part,
-                    "total": total,
-                    "filename": filename,
-                    "path": path,
-                    "size": len(data),
-                    "mtime": mtime,
-                    "mode": mode,
-                },
-                separators=(",", ":"),
-            )
-            if len(caption) > 1024:
-                # Caption limit is 1024 chars; trim non-essential fields.
+        try:
+            while offset < len(data):
+                piece = data[offset : offset + self.chunk_size]
                 caption = json.dumps(
                     {
                         "tgdrive": "chunk",
@@ -386,36 +407,65 @@ class TelegramClient:
                         "part": part,
                         "total": total,
                         "filename": filename,
+                        "path": path,
                         "size": len(data),
+                        "mtime": mtime,
+                        "mode": mode,
                     },
                     separators=(",", ":"),
                 )
-            chunk_name = f"{filename}.part{part}"
-            ct0 = time.time()
-            msg = self.send_document(piece, chunk_name, caption=caption)
-            doc = msg.get("document", {})
-            chunks.append(
-                {
-                    "message_id": msg["message_id"],
-                    "file_id": doc.get("file_id"),
-                    "size": len(piece),
-                    "part": part,
-                }
-            )
-            log.debug(
-                "uploaded chunk %d/%d (%d bytes) in %.2fs",
-                part + 1,
-                total,
-                len(piece),
-                time.time() - ct0,
-            )
-            offset += self.chunk_size
-            part += 1
-            if on_progress:
+                if len(caption) > 1024:
+                    # Caption limit is 1024 chars; trim non-essential fields.
+                    caption = json.dumps(
+                        {
+                            "tgdrive": "chunk",
+                            "v": INDEX_VERSION,
+                            "uuid": uuid,
+                            "part": part,
+                            "total": total,
+                            "filename": filename,
+                            "size": len(data),
+                        },
+                        separators=(",", ":"),
+                    )
+                chunk_name = f"{filename}.part{part}"
+                ct0 = time.time()
+                msg = self.send_document(piece, chunk_name, caption=caption)
+                doc = msg.get("document", {})
+                chunks.append(
+                    {
+                        "message_id": msg["message_id"],
+                        "file_id": doc.get("file_id"),
+                        "size": len(piece),
+                        "part": part,
+                    }
+                )
+                log.debug(
+                    "uploaded chunk %d/%d (%d bytes) in %.2fs",
+                    part + 1,
+                    total,
+                    len(piece),
+                    time.time() - ct0,
+                )
+                offset += self.chunk_size
+                part += 1
+                if on_progress:
+                    try:
+                        on_progress(part, total)
+                    except Exception:
+                        pass
+        except Exception:
+            # Clean up any chunks that did upload so a partial failure does not
+            # leave orphaned documents in the chat, then re-raise.
+            if chunks:
+                log.warning("cleaning up %d/%d uploaded chunks after failure", len(chunks), total)
                 try:
-                    on_progress(part, total)
+                    self.delete_chunks(chunks)
                 except Exception:
                     pass
+            elapsed = time.time() - t0
+            log.error("upload of %s failed after %.2fs", path, elapsed)
+            raise
         elapsed = time.time() - t0
         rate = len(data) / elapsed / 1e6 if elapsed > 0 else 0.0
         log.info(

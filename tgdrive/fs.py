@@ -134,7 +134,7 @@ class TgDriveFS(Operations):
             try:
                 meta = self.tg.write_index(idx)
             except Exception as e:
-                log.error("failed to persist index: %s", e)
+                log.exception("failed to persist index (entries=%d): %s", len(self.entries), e)
                 raise FuseOSError(errno.EIO)
             self._fingerprint = json.dumps(meta, sort_keys=True, separators=(",", ":"))
 
@@ -142,10 +142,14 @@ class TgDriveFS(Operations):
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                fp = self._compute_fingerprint()
-                if fp and fp != self._fingerprint:
-                    log.info("detected remote index change, reloading")
-                    self._load_index()
+                remote_fp = self._compute_fingerprint()
+                if remote_fp and remote_fp != self._fingerprint:
+                    # Our own persist may have raced with this fetch and already
+                    # updated the fingerprint; re-check before reloading to avoid
+                    # a spurious (and potentially clobbering) reload.
+                    if remote_fp != self._fingerprint:
+                        log.info("detected remote index change, reloading")
+                        self._load_index()
             except Exception as e:
                 log.debug("poll error: %s", e)
             self._stop.wait(POLL_INTERVAL)
@@ -340,7 +344,7 @@ class TgDriveFS(Operations):
         }
         with self._lock:
             self.entries[path] = entry
-        self._persist()
+            self._persist()
         return self._new_fh(path, start_empty=True, write_mode=True)
 
     def read(self, path: str, size: int, offset: int, fh: int) -> bytes:
@@ -438,7 +442,9 @@ class TgDriveFS(Operations):
                 entry["size"] = len(data)
                 entry["mtime"] = mtime
                 entry["uuid"] = h.uuid
-        self._persist()
+            # Persist atomically with the chunk/size update so a poller reload
+            # cannot clobber the just-uploaded file metadata.
+            self._persist()
         h.dirty = False
         h.loaded = True
         h.flushed_chunks = chunks
@@ -488,7 +494,7 @@ class TgDriveFS(Operations):
                     entry["chunks"] = []
                     entry["size"] = 0
                     entry["mtime"] = _now()
-            self._persist()
+                self._persist()
             return 0
         try:
             data = self.tg.download_chunks(chunks) if chunks else b""
@@ -515,22 +521,24 @@ class TgDriveFS(Operations):
                 entry["chunks"] = new_chunks
                 entry["size"] = len(data)
                 entry["mtime"] = _now()
-        self._persist()
+            self._persist()
         return 0
 
     def unlink(self, path: str) -> int:
         path = _norm(path)
         with self._lock:
             entry = self.entries.pop(path, None)
-        if entry is None:
-            raise FuseOSError(errno.ENOENT)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            # Persist atomically with the pop so a poller reload cannot
+            # resurrect the entry between the pop and the persist.
+            self._persist()
         chunks = entry.get("chunks", [])
         if chunks:
             try:
                 self.tg.delete_chunks(chunks)
             except Exception as e:
                 log.warning("unlink delete chunks: %s", e)
-        self._persist()
         return 0
 
     def rename(self, old: str, new: str) -> int:
@@ -546,7 +554,7 @@ class TgDriveFS(Operations):
             for h in self._handles.values():
                 if h.path == old:
                     h.path = new
-        self._persist()
+            self._persist()
         return 0
 
     def mkdir(self, path: str, mode: int) -> int:
@@ -565,7 +573,7 @@ class TgDriveFS(Operations):
                 "uid": self._uid,
                 "gid": self._gid,
             }
-        self._persist()
+            self._persist()
         return 0
 
     def _is_implicit_dir_parent(self, path: str) -> bool:
@@ -592,7 +600,7 @@ class TgDriveFS(Operations):
                 if k.startswith(prefix):
                     raise FuseOSError(errno.ENOTEMPTY)
             self.entries.pop(path, None)
-        self._persist()
+            self._persist()
         return 0
 
     def utimens(self, path: str, times: tuple[float, float] | None = None) -> int:
@@ -619,7 +627,7 @@ class TgDriveFS(Operations):
                 raise FuseOSError(errno.ENOENT)
             entry["atime"] = atime
             entry["mtime"] = mtime
-        self._persist()
+            self._persist()
         return 0
 
     def chmod(self, path: str, mode: int) -> int:
@@ -632,7 +640,7 @@ class TgDriveFS(Operations):
                 entry["mode"] = stat.S_IFDIR | (mode & 0o7777)
             else:
                 entry["mode"] = stat.S_IFREG | (mode & 0o7777)
-        self._persist()
+            self._persist()
         return 0
 
     def chown(self, path: str, uid: int, gid: int) -> int:
@@ -645,7 +653,7 @@ class TgDriveFS(Operations):
                 entry["uid"] = uid
             if gid != -1:
                 entry["gid"] = gid
-        self._persist()
+            self._persist()
         return 0
 
     def statfs(self, path: str) -> dict[str, int]:
