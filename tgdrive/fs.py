@@ -8,6 +8,7 @@ to temporary files and only uploaded on flush()/fsync(); release() does NOT flus
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -42,6 +43,16 @@ def _now() -> float:
     return time.time()
 
 
+_DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "tgdrive")
+
+
+def _cache_path(file_id: str) -> str:
+    d = os.environ.get("TGDRIVE_CACHE_DIR") or _DEFAULT_CACHE_DIR
+    os.makedirs(d, exist_ok=True)
+    h = hashlib.sha256(file_id.encode()).hexdigest()
+    return os.path.join(d, h)
+
+
 class _Handle:
     """An open file handle.
 
@@ -61,6 +72,7 @@ class _Handle:
         "uuid",
         "start_empty",
         "write_mode",
+        "downloaded_parts",
     )
 
     def __init__(self, fh: int, path: str, start_empty: bool = False, write_mode: bool = False):
@@ -74,6 +86,7 @@ class _Handle:
         self.uuid = uuid.uuid4().hex
         self.start_empty = start_empty
         self.write_mode = write_mode
+        self.downloaded_parts: set[int] = set()
 
 
 class TgDriveFS(Operations):
@@ -353,14 +366,57 @@ class TgDriveFS(Operations):
     def read(self, path: str, size: int, offset: int, fh: int) -> bytes:
         path = _norm(path)
         h = self._get_handle(fh)
-        # Download once per handle (lazy), then serve every read from the
-        # temporary file. Without this, every 128 KB kernel read would
-        # re-download the entire file from Telegram.
-        self._ensure_loaded(h)
-        if offset >= h.size:
+
+        # For dirty/written-to handles the temp file is authoritative.
+        if h.dirty:
+            self._ensure_loaded(h)
+            if offset >= h.size:
+                return b""
+            h.tmp.seek(offset)
+            return h.tmp.read(size)
+
+        # Read-only path: download only the chunks needed for this range.
+        with self._lock:
+            entry = self.entries.get(h.path)
+            if entry is None:
+                raise FuseOSError(errno.ENOENT)
+            chunks = list(entry.get("chunks", []))
+            file_size = int(entry.get("size", 0))
+
+        if offset >= file_size:
             return b""
+
+        nread = min(size, file_size - offset)
+
+        if chunks and nread:
+            cs = self.tg.chunk_size
+            start_part = offset // cs
+            end_part = (offset + nread - 1) // cs
+
+            for part in range(start_part, end_part + 1):
+                if part in h.downloaded_parts:
+                    continue
+                cm = next((c for c in chunks if c.get("part") == part), None)
+                if cm is None:
+                    continue
+                fid = cm["file_id"]
+                cp = _cache_path(fid)
+                try:
+                    with open(cp, "rb") as cf:
+                        data = cf.read()
+                except (FileNotFoundError, IOError):
+                    data = self.tg.download_file(fid)
+                    try:
+                        with open(cp, "wb") as cf:
+                            cf.write(data)
+                    except Exception:
+                        pass
+                h.tmp.seek(part * cs)
+                h.tmp.write(data)
+                h.downloaded_parts.add(part)
+
         h.tmp.seek(offset)
-        return h.tmp.read(size)
+        return h.tmp.read(nread)
 
     def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
         path = _norm(path)
