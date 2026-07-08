@@ -11,16 +11,16 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any
 
 import requests
 
 log = logging.getLogger("tgdrive.telegram")
 
-# Telegram Bot API: getFile only works for files up to 20 MB, so every chunk
-# (and the index document) must stay at or below this size.
-CHUNK_SIZE = 20 * 1024 * 1024
+# Telegram Bot API: getFile only works for files up to 20 MB. Keep chunks below
+# that limit; 10 MB uploads are materially less likely to hit write timeouts.
+CHUNK_SIZE = 10 * 1024 * 1024
 API_BASE = "https://api.telegram.org"
 INDEX_MAGIC = "tgdrive"
 INDEX_VERSION = 1
@@ -477,6 +477,106 @@ class TelegramClient:
         )
         return chunks
 
+    def upload_chunks_from_file(
+        self,
+        path: str,
+        fileobj,
+        size: int,
+        mtime: float,
+        mode: int,
+        uuid: str,
+        on_progress=None,
+    ) -> list[dict[str, Any]]:
+        """Upload chunks read from a seekable file object without buffering the whole file."""
+        if size == 0:
+            log.info("uploading %s (0 bytes, 0 chunk(s))", path)
+            return []
+        total = max(1, (size + self.chunk_size - 1) // self.chunk_size)
+        chunks: list[dict[str, Any]] = []
+        part = 0
+        filename = path.rsplit("/", 1)[-1] or "file"
+        log.info("uploading %s (%d bytes, %d chunk(s))", path, size, total)
+        t0 = time.time()
+        try:
+            fileobj.seek(0)
+            while part < total:
+                piece = fileobj.read(self.chunk_size)
+                if not piece:
+                    break
+                caption = json.dumps(
+                    {
+                        "tgdrive": "chunk",
+                        "v": INDEX_VERSION,
+                        "uuid": uuid,
+                        "part": part,
+                        "total": total,
+                        "filename": filename,
+                        "path": path,
+                        "size": size,
+                        "mtime": mtime,
+                        "mode": mode,
+                    },
+                    separators=(",", ":"),
+                )
+                if len(caption) > 1024:
+                    caption = json.dumps(
+                        {
+                            "tgdrive": "chunk",
+                            "v": INDEX_VERSION,
+                            "uuid": uuid,
+                            "part": part,
+                            "total": total,
+                            "filename": filename,
+                            "size": size,
+                        },
+                        separators=(",", ":"),
+                    )
+                chunk_name = f"{filename}.part{part}"
+                ct0 = time.time()
+                msg = self.send_document(piece, chunk_name, caption=caption)
+                doc = msg.get("document", {})
+                chunks.append(
+                    {
+                        "message_id": msg["message_id"],
+                        "file_id": doc.get("file_id"),
+                        "size": len(piece),
+                        "part": part,
+                    }
+                )
+                log.debug(
+                    "uploaded chunk %d/%d (%d bytes) in %.2fs",
+                    part + 1,
+                    total,
+                    len(piece),
+                    time.time() - ct0,
+                )
+                part += 1
+                if on_progress:
+                    try:
+                        on_progress(part, total)
+                    except Exception:
+                        pass
+        except Exception:
+            if chunks:
+                log.warning("cleaning up %d/%d uploaded chunks after failure", len(chunks), total)
+                try:
+                    self.delete_chunks(chunks)
+                except Exception:
+                    pass
+            elapsed = time.time() - t0
+            log.error("upload of %s failed after %.2fs", path, elapsed)
+            raise
+        elapsed = time.time() - t0
+        rate = size / elapsed / 1e6 if elapsed > 0 else 0.0
+        log.info(
+            "uploaded %s (%d bytes) in %.2fs (%.2f MB/s)",
+            path,
+            size,
+            elapsed,
+            rate,
+        )
+        return chunks
+
     def download_chunks(
         self,
         chunks: list[dict[str, Any]],
@@ -527,6 +627,59 @@ class TelegramClient:
             for f in futs:
                 f.result()
         return b"".join(b for b in results if b is not None)
+
+    def download_chunks_to_file(
+        self,
+        chunks: list[dict[str, Any]],
+        fileobj,
+        on_progress=None,
+        max_workers: int = 8,
+    ) -> int:
+        """Download chunks into a seekable file object without concatenating them in RAM."""
+        ordered = [c for c in sorted(chunks, key=lambda c: c.get("part", 0)) if c.get("file_id")]
+        n = len(ordered)
+        fileobj.seek(0)
+        fileobj.truncate(0)
+        if n == 0:
+            return 0
+        offsets: list[int] = []
+        offset = 0
+        for ch in ordered:
+            offsets.append(offset)
+            offset += int(ch.get("size", 0))
+        total_bytes = offset
+        done = 0
+        bytes_done = 0
+
+        def fetch(idx: int) -> tuple[int, bytes, float]:
+            t0 = time.time()
+            return idx, self.download_file(ordered[idx]["file_id"]), time.time() - t0
+
+        workers = max(1, min(max_workers, n))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tg-dl") as pool:
+            pending = {pool.submit(fetch, i) for i in range(n)}
+            while pending:
+                done_futs, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done_futs:
+                    idx, data, elapsed = fut.result()
+                    fileobj.seek(offsets[idx])
+                    fileobj.write(data)
+                    done += 1
+                    bytes_done += len(data)
+                    log.debug(
+                        "chunk %d/%d (%d bytes) downloaded in %.2fs",
+                        done,
+                        n,
+                        len(data),
+                        elapsed,
+                    )
+                    if on_progress:
+                        try:
+                            on_progress(done, n, bytes_done, total_bytes)
+                        except Exception:
+                            pass
+        fileobj.flush()
+        return total_bytes
 
     def delete_chunks(self, chunks: list[dict[str, Any]]) -> None:
         ids = [c.get("message_id") for c in chunks if c.get("message_id")]
