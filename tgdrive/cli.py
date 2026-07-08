@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="chunk_size",
         type=int,
         default=None,
-        help="Chunk size in bytes (default: 20 MB).",
+        help="Chunk size in bytes (default: 15 MB).",
     )
     parser.add_argument(
         "mountpoint",

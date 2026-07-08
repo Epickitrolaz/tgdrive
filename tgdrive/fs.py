@@ -1,8 +1,8 @@
 """FUSE filesystem backed by a Telegram chat.
 
 Files are stored as Telegram document messages (20 MB chunks) and a JSON
-directory index is kept in the chat's pinned message. Written data is buffered
-in memory and only uploaded on flush()/fsync(); release() does NOT flush.
+directory index is kept in the chat's pinned message. Open file data is spooled
+to temporary files and only uploaded on flush()/fsync(); release() does NOT flush.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -44,17 +45,16 @@ def _now() -> float:
 class _Handle:
     """An open file handle.
 
-    Holds an in-memory buffer that is the single source of truth for this
-    handle: for read-only handles it is filled once (lazily) from Telegram and
-    reused for every read(); for writable handles it accumulates writes until
-    flush(). Nothing is ever written to disk — this is purely an in-memory,
-    per-handle cache.
+    Holds a temporary file that is the single source of truth for this handle:
+    for read-only handles it is filled once (lazily) from Telegram and reused
+    for every read(); for writable handles it accumulates writes until flush().
     """
 
     __slots__ = (
         "fh",
         "path",
-        "buffer",
+        "tmp",
+        "size",
         "loaded",
         "dirty",
         "flushed_chunks",
@@ -66,7 +66,8 @@ class _Handle:
     def __init__(self, fh: int, path: str, start_empty: bool = False, write_mode: bool = False):
         self.fh = fh
         self.path = path
-        self.buffer = bytearray()
+        self.tmp = tempfile.TemporaryFile()
+        self.size = 0
         self.loaded = False
         self.dirty = False
         self.flushed_chunks: list[dict[str, Any]] | None = None
@@ -172,9 +173,9 @@ class TgDriveFS(Operations):
         return h
 
     def _ensure_loaded(self, h: _Handle) -> None:
-        """Populate the handle's buffer from Telegram exactly once.
+        """Populate the handle's temporary file from Telegram exactly once.
 
-        After the first call the buffer is reused for all subsequent reads on
+        After the first call the temporary file is reused for all subsequent reads on
         this handle, so a 100 MB file is downloaded a single time per open()
         instead of once per 128 KB read.
         """
@@ -184,7 +185,9 @@ class TgDriveFS(Operations):
             entry = self.entries.get(h.path)
             chunks = list(entry.get("chunks", [])) if entry else []
         if h.start_empty or not chunks:
-            h.buffer = bytearray()
+            h.tmp.seek(0)
+            h.tmp.truncate(0)
+            h.size = 0
             h.loaded = True
             return
         size = int(entry.get("size", sum(int(c.get("size", 0)) for c in chunks))) if entry else 0
@@ -215,18 +218,18 @@ class TgDriveFS(Operations):
                 )
 
         try:
-            data = self.tg.download_chunks(chunks, on_progress=on_progress)
+            downloaded = self.tg.download_chunks_to_file(chunks, h.tmp, on_progress=on_progress)
         except Exception as e:
             log.error("download failed for %s: %s", h.path, e)
             raise FuseOSError(errno.EIO)
-        h.buffer = bytearray(data)
+        h.size = downloaded
         h.loaded = True
         elapsed = time.time() - t0
-        rate = len(data) / elapsed / 1e6 if elapsed > 0 else 0.0
+        rate = h.size / elapsed / 1e6 if elapsed > 0 else 0.0
         log.info(
             "downloaded %s (%d bytes) in %.2fs (%.2f MB/s)",
             h.path,
-            len(data),
+            h.size,
             elapsed,
             rate,
         )
@@ -351,20 +354,20 @@ class TgDriveFS(Operations):
         path = _norm(path)
         h = self._get_handle(fh)
         # Download once per handle (lazy), then serve every read from the
-        # in-memory buffer. Without this, every 128 KB kernel read would
+        # temporary file. Without this, every 128 KB kernel read would
         # re-download the entire file from Telegram.
         self._ensure_loaded(h)
-        data = h.buffer
-        if offset >= len(data):
+        if offset >= h.size:
             return b""
-        return bytes(data[offset : offset + size])
+        h.tmp.seek(offset)
+        return h.tmp.read(size)
 
     def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
         path = _norm(path)
         h = self._get_handle(fh)
         # Load existing content so offset-based writes merge correctly (unless
         # the handle was opened with O_TRUNC / via create(), in which case
-        # _ensure_loaded is a no-op that leaves an empty buffer).
+        # _ensure_loaded is a no-op that leaves an empty temporary file).
         self._ensure_loaded(h)
         with self._lock:
             # Ensure file entry exists.
@@ -383,11 +386,11 @@ class TgDriveFS(Operations):
                 }
             entry = self.entries[path]
             entry["uuid"] = h.uuid
-        buf = h.buffer
         end = offset + len(data)
-        if end > len(buf):
-            buf.extend(b"\x00" * (end - len(buf)))
-        buf[offset:end] = data
+        h.tmp.seek(offset)
+        h.tmp.write(data)
+        if end > h.size:
+            h.size = end
         h.dirty = True
         h.flushed_chunks = None
         return len(data)
@@ -397,7 +400,6 @@ class TgDriveFS(Operations):
         h = self._get_handle(fh)
         if not h.dirty:
             return 0
-        data = bytes(h.buffer)
         # Delete any previously flushed chunks from this handle.
         with self._lock:
             entry = self.entries.get(path)
@@ -431,7 +433,7 @@ class TgDriveFS(Operations):
             mtime = float(entry.get("mtime", now))
             mode = int(entry.get("mode", stat.S_IFREG | FILE_MODE))
         try:
-            chunks = self.tg.upload_chunks(path, data, mtime, mode, h.uuid)
+            chunks = self.tg.upload_chunks_from_file(path, h.tmp, h.size, mtime, mode, h.uuid)
         except Exception as e:
             log.error("upload failed for %s: %s", path, e)
             raise FuseOSError(errno.EIO)
@@ -439,7 +441,7 @@ class TgDriveFS(Operations):
             entry = self.entries.get(path)
             if entry is not None:
                 entry["chunks"] = chunks
-                entry["size"] = len(data)
+                entry["size"] = h.size
                 entry["mtime"] = mtime
                 entry["uuid"] = h.uuid
             # Persist atomically with the chunk/size update so a poller reload
@@ -455,7 +457,12 @@ class TgDriveFS(Operations):
 
     def release(self, path: str, fh: int) -> int:
         with self._fh_lock:
-            self._handles.pop(fh, None)
+            h = self._handles.pop(fh, None)
+        if h is not None:
+            try:
+                h.tmp.close()
+            except Exception:
+                pass
         return 0
 
     def truncate(self, path: str, length: int, fh: int | None = None) -> int:
@@ -463,10 +470,8 @@ class TgDriveFS(Operations):
         if fh is not None and fh in self._handles:
             h = self._handles[fh]
             self._ensure_loaded(h)
-            if length < len(h.buffer):
-                del h.buffer[length:]
-            else:
-                h.buffer.extend(b"\x00" * (length - len(h.buffer)))
+            h.tmp.truncate(length)
+            h.size = length
             h.dirty = True
             h.flushed_chunks = None
             with self._lock:
@@ -496,30 +501,29 @@ class TgDriveFS(Operations):
                     entry["mtime"] = _now()
                 self._persist()
             return 0
-        try:
-            data = self.tg.download_chunks(chunks) if chunks else b""
-        except Exception as e:
-            log.error("truncate read failed: %s", e)
-            raise FuseOSError(errno.EIO)
-        if length < len(data):
-            data = data[:length]
-        else:
-            data = data + b"\x00" * (length - len(data))
-        if chunks:
+        with tempfile.TemporaryFile() as tmp:
             try:
-                self.tg.delete_chunks(chunks)
-            except Exception:
-                pass
-        try:
-            new_chunks = self.tg.upload_chunks(path, data, mtime, mode, file_uuid)
-        except Exception as e:
-            log.error("truncate upload failed: %s", e)
-            raise FuseOSError(errno.EIO)
+                if chunks:
+                    self.tg.download_chunks_to_file(chunks, tmp)
+            except Exception as e:
+                log.error("truncate read failed: %s", e)
+                raise FuseOSError(errno.EIO)
+            tmp.truncate(length)
+            if chunks:
+                try:
+                    self.tg.delete_chunks(chunks)
+                except Exception:
+                    pass
+            try:
+                new_chunks = self.tg.upload_chunks_from_file(path, tmp, length, mtime, mode, file_uuid)
+            except Exception as e:
+                log.error("truncate upload failed: %s", e)
+                raise FuseOSError(errno.EIO)
         with self._lock:
             entry = self.entries.get(path)
             if entry is not None:
                 entry["chunks"] = new_chunks
-                entry["size"] = len(data)
+                entry["size"] = length
                 entry["mtime"] = _now()
             self._persist()
         return 0
