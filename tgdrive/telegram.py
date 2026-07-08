@@ -19,8 +19,8 @@ import requests
 log = logging.getLogger("tgdrive.telegram")
 
 # Telegram Bot API: getFile only works for files up to 20 MB. Keep chunks below
-# that limit; 10 MB uploads are materially less likely to hit write timeouts.
-CHUNK_SIZE = 10 * 1024 * 1024
+# that limit; testing showed 15 MB uploads were fastest without write timeouts.
+CHUNK_SIZE = 15 * 1024 * 1024
 API_BASE = "https://api.telegram.org"
 INDEX_MAGIC = "tgdrive"
 INDEX_VERSION = 1
