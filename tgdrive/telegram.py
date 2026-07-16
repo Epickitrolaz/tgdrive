@@ -9,6 +9,8 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -144,19 +146,47 @@ class TelegramClient:
     # -- message helpers ----------------------------------------------------
     def send_document(
         self,
-        data: bytes,
+        data: bytes | "os.PathLike[str]" | io.IOBase,
         filename: str,
         caption: str | None = None,
         disable_notification: bool = True,
     ) -> dict[str, Any]:
-        files = {"document": (filename, io.BytesIO(data))}
+        """Upload a document from memory or from a file path / file-like object.
+
+        ``data`` may be:
+
+        * ``bytes`` / ``bytearray`` - buffered in RAM (only for small payloads,
+          e.g. the index document).
+        * a filesystem path (``str``/``os.PathLike``) - ``requests`` opens it
+          and streams the body from disk, so RAM usage stays tiny.
+        * any file-like object with ``.read()`` - used as the body source.
+
+        On low-memory devices the caller should always prefer the path /
+        file-object forms so the chunk body is never staged in RAM.
+        """
+        if isinstance(data, (bytes, bytearray)):
+            files = {"document": (filename, io.BytesIO(data))}
+        elif isinstance(data, (str, os.PathLike)):
+            # requests accepts a path and streams the body from disk.
+            files = {"document": (filename, open(data, "rb"))}
+        else:
+            files = {"document": (filename, data)}
         params: dict[str, Any] = {"chat_id": self.chat_id}
         if caption is not None:
             params["caption"] = caption
             params["parse_mode"] = "HTML"
         if disable_notification:
             params["disable_notification"] = True
-        return self._request("sendDocument", params=params, files=files)
+        try:
+            return self._request("sendDocument", params=params, files=files)
+        finally:
+            # If we opened a file by path, close the handle we created.
+            if isinstance(data, (str, os.PathLike)):
+                handle = files["document"][1]
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
     def send_text(self, text: str, disable_notification: bool = True) -> dict[str, Any]:
         params: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
@@ -487,7 +517,18 @@ class TelegramClient:
         uuid: str,
         on_progress=None,
     ) -> list[dict[str, Any]]:
-        """Upload chunks read from a seekable file object without buffering the whole file."""
+        """Upload chunks read from a seekable file object without buffering the whole file.
+
+        Each chunk is staged to its own small temporary file on disk and then
+        uploaded from that path. ``requests`` opens the path and streams the
+        body to Telegram, so peak RAM usage is roughly one chunk (~15 MB)
+        rather than the whole file. The temp file is unlinked as soon as the
+        upload returns, so disk usage is also bounded to one chunk at a time.
+
+        This is the path used on low-memory devices (e.g. a Pi Zero 2 W with
+        512 MB of RAM) where buffering the entire file before sending would
+        crash the process for any file larger than ~250 MB.
+        """
         if size == 0:
             log.info("uploading %s (0 bytes, 0 chunk(s))", path)
             return []
@@ -503,22 +544,14 @@ class TelegramClient:
                 piece = fileobj.read(self.chunk_size)
                 if not piece:
                     break
-                caption = json.dumps(
-                    {
-                        "tgdrive": "chunk",
-                        "v": INDEX_VERSION,
-                        "uuid": uuid,
-                        "part": part,
-                        "total": total,
-                        "filename": filename,
-                        "path": path,
-                        "size": size,
-                        "mtime": mtime,
-                        "mode": mode,
-                    },
-                    separators=(",", ":"),
-                )
-                if len(caption) > 1024:
+                # Spool the chunk to disk so requests streams the body from a
+                # file rather than a BytesIO in RAM. The spool file lives in
+                # the system temp directory and is unlinked immediately after
+                # the upload completes (success or failure).
+                spool_fd, spool_path = tempfile.mkstemp(prefix="tgdrive-chunk-", suffix=".bin")
+                try:
+                    with os.fdopen(spool_fd, "wb") as spool_fh:
+                        spool_fh.write(piece)
                     caption = json.dumps(
                         {
                             "tgdrive": "chunk",
@@ -527,29 +560,53 @@ class TelegramClient:
                             "part": part,
                             "total": total,
                             "filename": filename,
+                            "path": path,
                             "size": size,
+                            "mtime": mtime,
+                            "mode": mode,
                         },
                         separators=(",", ":"),
                     )
-                chunk_name = f"{filename}.part{part}"
-                ct0 = time.time()
-                msg = self.send_document(piece, chunk_name, caption=caption)
-                doc = msg.get("document", {})
-                chunks.append(
-                    {
-                        "message_id": msg["message_id"],
-                        "file_id": doc.get("file_id"),
-                        "size": len(piece),
-                        "part": part,
-                    }
-                )
-                log.debug(
-                    "uploaded chunk %d/%d (%d bytes) in %.2fs",
-                    part + 1,
-                    total,
-                    len(piece),
-                    time.time() - ct0,
-                )
+                    if len(caption) > 1024:
+                        caption = json.dumps(
+                            {
+                                "tgdrive": "chunk",
+                                "v": INDEX_VERSION,
+                                "uuid": uuid,
+                                "part": part,
+                                "total": total,
+                                "filename": filename,
+                                "size": size,
+                            },
+                            separators=(",", ":"),
+                        )
+                    chunk_name = f"{filename}.part{part}"
+                    ct0 = time.time()
+                    msg = self.send_document(spool_path, chunk_name, caption=caption)
+                    doc = msg.get("document", {})
+                    chunks.append(
+                        {
+                            "message_id": msg["message_id"],
+                            "file_id": doc.get("file_id"),
+                            "size": len(piece),
+                            "part": part,
+                        }
+                    )
+                    log.debug(
+                        "uploaded chunk %d/%d (%d bytes) in %.2fs",
+                        part + 1,
+                        total,
+                        len(piece),
+                        time.time() - ct0,
+                    )
+                    # Drop the bytes from memory; the spool file is the only
+                    # remaining copy of this chunk's body.
+                    del piece
+                finally:
+                    try:
+                        os.unlink(spool_path)
+                    except OSError:
+                        pass
                 part += 1
                 if on_progress:
                     try:

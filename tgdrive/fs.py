@@ -44,6 +44,22 @@ def _now() -> float:
 
 
 _DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "tgdrive")
+_DEFAULT_TMP_DIR = tempfile.gettempdir()
+
+
+def _tmp_dir() -> str:
+    """Directory for per-handle write spool files.
+
+    On a stock Pi the rootfs is small, so a multi-hundred-MB write will
+    fill ``/tmp`` and the kernel returns ``ENOSPC`` to ``cp`` ("No space
+    left on device"). Point ``TGDRIVE_TMP_DIR`` at a drive with enough
+    free space (a USB stick, an external SSD, or a tmpfs sized to fit
+    the largest file you intend to copy) and tgdrive will spool writes
+    there instead.
+    """
+    d = os.environ.get("TGDRIVE_TMP_DIR") or _DEFAULT_TMP_DIR
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _cache_path(file_id: str) -> str:
@@ -78,7 +94,9 @@ class _Handle:
     def __init__(self, fh: int, path: str, start_empty: bool = False, write_mode: bool = False):
         self.fh = fh
         self.path = path
-        self.tmp = tempfile.TemporaryFile()
+        # The spool file lives in TGDRIVE_TMP_DIR (or /tmp by default) so
+        # writes don't fill the rootfs on a stock Pi. See _tmp_dir() for why.
+        self.tmp = tempfile.TemporaryFile(dir=_tmp_dir())
         self.size = 0
         self.loaded = False
         self.dirty = False
@@ -557,7 +575,7 @@ class TgDriveFS(Operations):
                     entry["mtime"] = _now()
                 self._persist()
             return 0
-        with tempfile.TemporaryFile() as tmp:
+        with tempfile.TemporaryFile(dir=_tmp_dir()) as tmp:
             try:
                 if chunks:
                     self.tg.download_chunks_to_file(chunks, tmp)
