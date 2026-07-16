@@ -38,18 +38,27 @@
 
 ```
 User writes → temp file → upload_chunks_from_file()
-                           │
-              ┌────────────▼────────────┐
-              │  For each chunk:        │
-              │  POST sendDocument      │
-              │  (sequential, 15 MB)    │
-              │  ↓                      │
-              │  Telegram stores doc    │
-              │  Returns file_id        │
-              ├─────────────────────────┤
-              │  Update pinned index    │
-              │  (inline or doc-based)  │
-              └─────────────────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │  For each chunk:        │
+               │  1. Spool chunk body    │
+               │     to a temp file on   │
+               │     disk (TGDRIVE_TMP_  │
+               │     DIR or /tmp)        │
+               │  2. POST sendDocument   │
+               │     (streams body from  │
+               │     disk via requests)  │
+               │  3. unlink() the spool  │
+               │     file before next    │
+               │     chunk               │
+               │  (sequential, 15 MB)    │
+               │  ↓                      │
+               │  Telegram stores doc    │
+               │  Returns file_id        │
+               ├─────────────────────────┤
+               │  Update pinned index    │
+               │  (inline or doc-based)  │
+               └─────────────────────────┘
 ```
 
 **File read flow** (on `read()`):
@@ -121,6 +130,46 @@ Downloads are cached on disk at `~/.cache/tgdrive/` to avoid re-fetching.
 | `--chunk-size`  | —                | 15 MB          | Upload chunk size in bytes        |
 | `mountpoint`    | —                | `/mnt/tgdrive` | FUSE mount point                  |
 
+| Env                   | Default                | Description                                                  |
+|-----------------------|------------------------|--------------------------------------------------------------|
+| `TGDRIVE_TOKEN`       | —                      | Telegram bot token (alternative to `--token`)                |
+| `TGDRIVE_CHAT_ID`     | —                      | Chat ID (alternative to `--chat-id`)                         |
+| `TGDRIVE_CACHE_DIR`   | `~/.cache/tgdrive`     | Where downloaded chunks are cached on disk                   |
+| `TGDRIVE_TMP_DIR`     | `/tmp`                 | Where per-handle write spools and chunk-upload spools live   |
+
+## Low-memory devices (Raspberry Pi, etc.)
+
+By default tgdrive buffers each chunk body in RAM only long enough to wrap
+it in an `io.BytesIO` for the upload POST. On a host with limited RAM
+(e.g. a Pi Zero 2 W with 512 MB) the kernel can return `ENOSPC` ("No space
+left on device") on the local spool before the bytes ever reach Telegram.
+Two changes keep memory and disk usage bounded to a single chunk (~15 MB)
+at any time:
+
+- **Spool-to-disk uploads.** `upload_chunks_from_file` writes each chunk
+  to a `tempfile.mkstemp(prefix="tgdrive-chunk-", suffix=".bin")` file
+  in `TGDRIVE_TMP_DIR`, hands the path to `requests` (which streams the
+  body from disk), then `os.unlink`s the file before reading the next
+  chunk. No chunk body is held in RAM for longer than it takes to write
+  it to the spool file.
+- **Configurable spool location.** The per-handle write spool
+  (`_Handle.tmp`) and the `truncate()` scratch file are both opened with
+  `dir=TGDRIVE_TMP_DIR`. On a stock Pi the rootfs is small, so point
+  this at a USB stick, external SSD, or a tmpfs sized to fit the largest
+  file you intend to copy:
+
+  ```bash
+  # Example: use a tmpfs sized for a 2 GB worst-case file
+  sudo mount -t tmpfs -o size=2G tmpfs /mnt/tgdrive-tmp
+  sudo TGDRIVE_TMP_DIR=/mnt/tgdrive-tmp python -m tgdrive \
+      --token BOT_TOKEN --chat-id CHAT_ID /mnt/tgdrive
+  ```
+
+  Make sure the target directory lives on a filesystem with at least as
+  much free space as the largest file you plan to copy into the mount.
+  Spool files are unlinked as soon as the upload completes (or the
+  handle is released), so steady-state disk usage stays at zero.
+
 ## Architecture Notes
 
 - **Uploads are sequential** — Telegram's sendDocument endpoint does not tolerate
@@ -138,5 +187,5 @@ Downloads are cached on disk at `~/.cache/tgdrive/` to avoid re-fetching.
 
 ## Credits
 
-This project was AI-generated using [OpenCode](https://opencode.ai) with GLM 5.2.
+This project was AI-generated using [OpenCode](https://opencode.ai) with GLM 5.2 and Kimi K2.7.
 The plan and architecture were designed by a human.
