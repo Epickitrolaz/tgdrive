@@ -21,6 +21,7 @@ from typing import Any
 
 from fuse import FUSE, FuseOSError, Operations
 
+from .cache import ChunkCache, default_cache_dir
 from .telegram import TelegramClient
 
 log = logging.getLogger("tgdrive.fs")
@@ -107,10 +108,94 @@ class _Handle:
         self.downloaded_parts: set[int] = set()
 
 
+class _CachingTempFile:
+    """A write-only file-like wrapper that mirrors each chunk into the cache.
+
+    The TelegramClient writes downloaded chunk bodies sequentially into a
+    file object; this wrapper observes the writes, pairs them back to the
+    originating ``file_id`` based on the running offset, and pushes each
+    chunk body into the :class:`ChunkCache` so it can be served from disk
+    next time without re-fetching from Telegram.
+    """
+
+    def __init__(self, real, cache: ChunkCache, chunks: list[dict[str, Any]]):
+        self._real = real
+        self._cache = cache
+        # Pair each chunk with the offset the client will write it at. We
+        # sort by part index to match download_chunks_to_file's ordering.
+        ordered = sorted(
+            (c for c in chunks if c.get("file_id")),
+            key=lambda c: c.get("part", 0),
+        )
+        self._plan: list[tuple[int, int, str]] = []
+        off = 0
+        for c in ordered:
+            size = int(c.get("size", 0))
+            if size <= 0:
+                continue
+            self._plan.append((off, off + size, c["file_id"]))
+            off += size
+        self._buf = bytearray()
+        self._write_pos = 0
+        self._plan_idx = 0
+
+    def write(self, data: bytes) -> int:
+        if not data:
+            return 0
+        self._buf.extend(data)
+        # Drain into the underlying file and into the cache, advancing through
+        # _plan as we cross chunk boundaries.
+        while self._buf and self._plan_idx < len(self._plan):
+            start, end, fid = self._plan[self._plan_idx]
+            chunk_pos = self._write_pos - start
+            need = (end - start) - chunk_pos
+            take = min(len(self._buf), need)
+            if take <= 0:
+                break
+            piece = bytes(self._buf[:take])
+            self._real.write(piece)
+            try:
+                self._cache.put(fid, piece)
+            except Exception as e:  # pragma: no cover - defensive
+                log.debug("cache put failed for %s: %s", fid, e)
+            del self._buf[:take]
+            self._write_pos += take
+            if self._write_pos >= end:
+                self._plan_idx += 1
+        # If the client writes past the planned chunks (shouldn't happen but
+        # is harmless), just mirror it to the real file.
+        if self._buf:
+            self._real.write(bytes(self._buf))
+            self._write_pos += len(self._buf)
+            self._buf.clear()
+        return len(data)
+
+    def seek(self, *args, **kwargs):
+        return self._real.seek(*args, **kwargs)
+
+    def truncate(self, *args, **kwargs):
+        return self._real.truncate(*args, **kwargs)
+
+    def flush(self):
+        return self._real.flush()
+
+    def close(self):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 class TgDriveFS(Operations):
     """A FUSE filesystem mapping a Telegram chat to a virtual drive."""
 
-    def __init__(self, token: str, chat_id: str | int, chunk_size: int | None = None):
+    def __init__(
+        self,
+        token: str,
+        chat_id: str | int,
+        chunk_size: int | None = None,
+        cache: ChunkCache | None = None,
+    ):
         kwargs: dict[str, Any] = {}
         if chunk_size:
             kwargs["chunk_size"] = chunk_size
@@ -124,6 +209,13 @@ class TgDriveFS(Operations):
         self._fingerprint: str = ""
         self._uid = os.getuid()
         self._gid = os.getgid()
+        # The on-disk chunk cache. The CLI hands us a fully configured instance
+        # (with size / disk-usage limits); fall back to an unconstrained one
+        # for tests and library users that don't care.
+        if cache is None:
+            cache = ChunkCache(cache_dir=os.environ.get("TGDRIVE_CACHE_DIR"))
+        self.cache = cache
+        self.cache.start()
         # Load initial index.
         self._load_index()
         # Start background poller.
@@ -188,6 +280,10 @@ class TgDriveFS(Operations):
 
     def destroy(self, path: str | None = None) -> None:
         self._stop.set()
+        try:
+            self.cache.stop()
+        except Exception:
+            pass
 
     # -- handle helpers ----------------------------------------------------
     def _new_fh(self, path: str, start_empty: bool = False, write_mode: bool = False) -> int:
@@ -248,8 +344,13 @@ class TgDriveFS(Operations):
                     rate,
                 )
 
+        # Wrap the file-like object the TelegramClient writes into so that
+        # each chunk body also lands in the on-disk cache and the cache's
+        # LRU/size eviction policy applies on prefetch paths.
+        cached_tmp = _CachingTempFile(h.tmp, self.cache, chunks)
+
         try:
-            downloaded = self.tg.download_chunks_to_file(chunks, h.tmp, on_progress=on_progress)
+            downloaded = self.tg.download_chunks_to_file(chunks, cached_tmp, on_progress=on_progress)
         except Exception as e:
             log.error("download failed for %s: %s", h.path, e)
             raise FuseOSError(errno.EIO)
@@ -418,17 +519,13 @@ class TgDriveFS(Operations):
                 if cm is None:
                     continue
                 fid = cm["file_id"]
-                cp = _cache_path(fid)
-                try:
-                    with open(cp, "rb") as cf:
-                        data = cf.read()
-                except (FileNotFoundError, IOError):
+                data = self.cache.get(fid)
+                if data is None:
                     data = self.tg.download_file(fid)
                     try:
-                        with open(cp, "wb") as cf:
-                            cf.write(data)
-                    except Exception:
-                        pass
+                        self.cache.put(fid, data)
+                    except Exception as e:
+                        log.debug("cache put failed for %s: %s", fid, e)
                 h.tmp.seek(part * cs)
                 h.tmp.write(data)
                 h.downloaded_parts.add(part)
@@ -760,8 +857,9 @@ def mount(
     foreground: bool = False,
     debug: bool = False,
     chunk_size: int | None = None,
+    cache: ChunkCache | None = None,
 ) -> None:
-    fs = TgDriveFS(token, chat_id, chunk_size=chunk_size)
+    fs = TgDriveFS(token, chat_id, chunk_size=chunk_size, cache=cache)
     log.info("mounting tgdrive at %s (foreground=%s)", mountpoint, foreground)
     FUSE(
         fs,

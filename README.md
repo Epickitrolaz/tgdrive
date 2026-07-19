@@ -130,12 +130,50 @@ Downloads are cached on disk at `~/.cache/tgdrive/` to avoid re-fetching.
 | `--chunk-size`  | —                | 15 MB          | Upload chunk size in bytes        |
 | `mountpoint`    | —                | `/mnt/tgdrive` | FUSE mount point                  |
 
-| Env                   | Default                | Description                                                  |
-|-----------------------|------------------------|--------------------------------------------------------------|
-| `TGDRIVE_TOKEN`       | —                      | Telegram bot token (alternative to `--token`)                |
-| `TGDRIVE_CHAT_ID`     | —                      | Chat ID (alternative to `--chat-id`)                         |
-| `TGDRIVE_CACHE_DIR`   | `~/.cache/tgdrive`     | Where downloaded chunks are cached on disk                   |
-| `TGDRIVE_TMP_DIR`     | `/tmp`                 | Where per-handle write spools and chunk-upload spools live   |
+| Env                          | Default             | Description                                                                |
+|------------------------------|---------------------|----------------------------------------------------------------------------|
+| `TGDRIVE_TOKEN`              | —                   | Telegram bot token (alternative to `--token`)                              |
+| `TGDRIVE_CHAT_ID`            | —                   | Chat ID (alternative to `--chat-id`)                                       |
+| `TGDRIVE_CACHE_DIR`          | `~/.cache/tgdrive`  | Where downloaded chunks are cached on disk                                 |
+| `TGDRIVE_TMP_DIR`            | `/tmp`              | Where per-handle write spools and chunk-upload spools live                 |
+| `TGDRIVE_MAX_CACHE_SIZE`     | unlimited           | Max on-disk cache size (e.g. `10G`); oldest entries evicted past it       |
+| `TGDRIVE_MAX_DISK_USAGE`     | disabled            | Max % used on the cache filesystem (e.g. `90`); triggers eviction          |
+| `TGDRIVE_MIN_FREE_BYTES`     | `1G`                | Floor of free bytes kept when enforcing `TGDRIVE_MAX_DISK_USAGE`           |
+| `TGDRIVE_CACHE_ENFORCE_INTERVAL` | `30`             | Seconds between background cache enforcement passes                        |
+
+## Cache management
+
+Downloaded chunks are stored in `~/.cache/tgdrive` (or `$TGDRIVE_CACHE_DIR`) so
+re-reading the same file does not re-fetch from Telegram. To keep the cache
+from filling the whole drive, tgdrive enforces two optional upper bounds,
+both checked on every cache write and by a background thread (every
+`--cache-enforce-interval` seconds):
+
+* `--max-cache-size 10G` (or `TGDRIVE_MAX_CACHE_SIZE=10G`) - the cache is
+  shrunk oldest-first whenever the total on-disk size exceeds this limit.
+  Accepts `K`/`M`/`G`/`T` suffixes and bare bytes.
+* `--max-disk-usage 90` (or `TGDRIVE_MAX_DISK_USAGE=90`) - if the filesystem
+  hosting the cache directory is more than this percent full, or there is
+  less than `TGDRIVE_MIN_FREE_BYTES` (default `1G`) of free space, the cache
+  is shrunk oldest-first until the disk is back under the limit. This is the
+  "full drive protection" mode and is recommended on long-running servers.
+
+Either bound can be set independently; both can be set together. Example for
+a long-running server with a 50 GB cache volume that should never go over
+90% full:
+
+```bash
+python -m tgdrive \
+    --token BOT_TOKEN --chat-id CHAT_ID \
+    --max-cache-size 10G \
+    --max-disk-usage 90 \
+    --min-free-bytes 2G \
+    --cache-enforce-interval 30 \
+    /mnt/tgdrive
+```
+
+`--clear-cache` (or the absence of one) wipes the cache directory on
+startup; use it when you want to start from scratch.
 
 ## Low-memory devices (Raspberry Pi, etc.)
 

@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 
+from .cache import add_cli_arguments, build_cache
 from .fs import mount
 
 
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Chunk size in bytes (default: 15 MB).",
     )
+    add_cli_arguments(parser)
     parser.add_argument(
         "mountpoint",
         nargs="?",
@@ -85,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"tgdrive: cannot create mountpoint {mountpoint}: {e}", file=sys.stderr)
             return 1
 
+    cache = build_cache(args)
+
     try:
         mount(
             token=args.token,
@@ -93,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             foreground=args.foreground,
             debug=args.debug,
             chunk_size=args.chunk_size,
+            cache=cache,
         )
     except KeyboardInterrupt:
         print("tgdrive: interrupted", file=sys.stderr)
