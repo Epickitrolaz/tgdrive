@@ -26,7 +26,8 @@ import shutil
 import threading
 import time
 from collections import OrderedDict
-from typing import Optional
+from concurrent.futures import Future
+from typing import Callable, Optional
 
 log = logging.getLogger("tgdrive.cache")
 
@@ -113,6 +114,13 @@ class ChunkCache:
         # out-of-band; the background enforcer reconciles from disk.
         self._size = 0
         self._lock = threading.RLock()
+        # In-flight downloads keyed by file_id. The first concurrent miss for
+        # a given file_id registers a Future here; every other miss blocks on
+        # the same Future so the chunk is fetched from Telegram at most once
+        # even if N users ask for it simultaneously. The value is removed
+        # once the Future resolves.
+        self._inflight: dict[str, Future] = {}
+        self._inflight_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._scanned = False
@@ -180,6 +188,59 @@ class ChunkCache:
             self._size += st.st_size
             self._maybe_enforce_locked()
         return path
+
+    # -- single-flight fetch ----------------------------------------------
+    def get_or_fetch(
+        self,
+        file_id: str,
+        fetcher: "Callable[[], bytes] | None" = None,
+    ) -> bytes:
+        """Return cached bytes for ``file_id``, fetching via ``fetcher`` on miss.
+
+        Concurrent calls for the same ``file_id`` share a single download:
+        the first caller invokes ``fetcher`` and every other caller blocks
+        on the same Future. This is what makes parallel multi-user reads
+        cheap when two users open the same media file at the same time.
+
+        If ``fetcher`` is ``None`` (or the on-disk cache is already populated)
+        no network I/O happens. The cache's LRU/size limits are still
+        enforced on the resulting write.
+        """
+        # Fast path: cache hit. Don't even take the in-flight lock.
+        data = self.get(file_id)
+        if data is not None:
+            return data
+        if fetcher is None:
+            raise KeyError(file_id)
+        # Cache miss; either join an in-flight fetch or start one.
+        with self._inflight_lock:
+            existing = self._inflight.get(file_id)
+            if existing is not None:
+                # Someone else is already fetching this chunk. Wait on their
+                # result instead of starting a duplicate download.
+                fut = existing
+                joined = True
+            else:
+                fut = Future()
+                self._inflight[file_id] = fut
+                joined = False
+        if joined:
+            return fut.result()
+        try:
+            data = fetcher()
+        except BaseException as e:
+            with self._inflight_lock:
+                self._inflight.pop(file_id, None)
+            fut.set_exception(e)
+            raise
+        try:
+            self.put(file_id, data)
+        except Exception as e:  # pragma: no cover - defensive
+            log.debug("cache put failed for %s: %s", file_id, e)
+        with self._inflight_lock:
+            self._inflight.pop(file_id, None)
+        fut.set_result(data)
+        return data
 
     def forget(self, file_id: str) -> None:
         with self._lock:

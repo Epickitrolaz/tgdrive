@@ -215,6 +215,17 @@ at any time:
   requests, gentler on rate limits.
 - **Downloads are parallel** — up to 8 concurrent `getFile`/`GET file` requests
   to saturate bandwidth.
+- **Multi-user reads are parallel and deduplicated** — each FUSE read may span
+  several chunks; a shared thread pool fetches the missing chunks concurrently.
+  Two users opening the same media file at the same time share a single
+  Telegram download per chunk (the chunk cache uses an in-flight Future map to
+  coalesce concurrent misses on the same `file_id`), so the second user does
+  not have to wait for the first user's stream to finish caching before
+  playback starts.
+- **Per-handle tmp files are serialized** — each open file handle owns its own
+  spool buffer protected by a lock, so two concurrent reads on the same
+  handle cannot corrupt each other's `seek`/`write`/`read` sequence. Different
+  handles (different users) run fully in parallel.
 - **Index** is stored in the pinned message. If it fits under 4000 chars, it is
   kept inline (edited in place, 1 API call). Otherwise it is uploaded as a
   `tgdrive_index.json` document and the pinned message becomes a "pointer".

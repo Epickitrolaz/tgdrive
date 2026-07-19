@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fuse import FUSE, FuseOSError, Operations
@@ -90,6 +91,7 @@ class _Handle:
         "start_empty",
         "write_mode",
         "downloaded_parts",
+        "lock",
     )
 
     def __init__(self, fh: int, path: str, start_empty: bool = False, write_mode: bool = False):
@@ -106,6 +108,10 @@ class _Handle:
         self.start_empty = start_empty
         self.write_mode = write_mode
         self.downloaded_parts: set[int] = set()
+        # Serializes concurrent reads on the same handle so the tmp file's
+        # seek/write/read sequence is not interleaved. Cross-handle reads run
+        # in parallel; this lock only protects a single _Handle.tmp buffer.
+        self.lock = threading.Lock()
 
 
 class _CachingTempFile:
@@ -216,6 +222,15 @@ class TgDriveFS(Operations):
             cache = ChunkCache(cache_dir=os.environ.get("TGDRIVE_CACHE_DIR"))
         self.cache = cache
         self.cache.start()
+        # Shared thread pool for parallel chunk downloads. A single FUSE
+        # read() may span several chunks; running them concurrently (and
+        # letting multiple users share the pool) is the difference between
+        # "second user waits behind first user" and "both streams start
+        # immediately". Eight workers matches the download parallelism that
+        # already exists in TelegramClient.download_chunks().
+        self._read_pool = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="tgdrive-read"
+        )
         # Load initial index.
         self._load_index()
         # Start background poller.
@@ -280,6 +295,10 @@ class TgDriveFS(Operations):
 
     def destroy(self, path: str | None = None) -> None:
         self._stop.set()
+        try:
+            self._read_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         try:
             self.cache.stop()
         except Exception:
@@ -489,12 +508,17 @@ class TgDriveFS(Operations):
         # For dirty/written-to handles the temp file is authoritative.
         if h.dirty:
             self._ensure_loaded(h)
-            if offset >= h.size:
-                return b""
-            h.tmp.seek(offset)
-            return h.tmp.read(size)
+            with h.lock:
+                if offset >= h.size:
+                    return b""
+                h.tmp.seek(offset)
+                return h.tmp.read(size)
 
-        # Read-only path: download only the chunks needed for this range.
+        # Read-only path: download only the chunks needed for this range,
+        # fetching any missing chunks in parallel via the shared pool. Two
+        # users opening the same file at the same time share a single
+        # download per chunk (the cache's in-flight Future), so the second
+        # user doesn't wait for the first user's stream to finish caching.
         with self._lock:
             entry = self.entries.get(h.path)
             if entry is None:
@@ -511,27 +535,64 @@ class TgDriveFS(Operations):
             cs = self.tg.chunk_size
             start_part = offset // cs
             end_part = (offset + nread - 1) // cs
-
+            # Chunks we still need bytes from. Already-loaded chunks are
+            # skipped; the rest are submitted to the pool together.
+            part_by_fid: dict[str, dict[str, Any]] = {}
+            for c in chunks:
+                fid = c.get("file_id")
+                if not fid:
+                    continue
+                part_by_fid[fid] = c
+            needed: list[dict[str, Any]] = []
             for part in range(start_part, end_part + 1):
                 if part in h.downloaded_parts:
                     continue
                 cm = next((c for c in chunks if c.get("part") == part), None)
                 if cm is None:
                     continue
+                # Cache hit short-circuits without going through the pool.
                 fid = cm["file_id"]
-                data = self.cache.get(fid)
-                if data is None:
-                    data = self.tg.download_file(fid)
-                    try:
-                        self.cache.put(fid, data)
-                    except Exception as e:
-                        log.debug("cache put failed for %s: %s", fid, e)
-                h.tmp.seek(part * cs)
-                h.tmp.write(data)
-                h.downloaded_parts.add(part)
+                if self.cache.get(fid) is not None:
+                    data = self.cache.get(fid)
+                    with h.lock:
+                        if part not in h.downloaded_parts:
+                            h.tmp.seek(part * cs)
+                            h.tmp.write(data)
+                            h.downloaded_parts.add(part)
+                    continue
+                needed.append(cm)
+            if needed:
+                tg = self.tg
+                cache = self.cache
+                pool = self._read_pool
 
-        h.tmp.seek(offset)
-        return h.tmp.read(nread)
+                def fetch_chunk(cm: dict[str, Any]) -> tuple[int, bytes]:
+                    fid = cm["file_id"]
+
+                    def fetcher() -> bytes:
+                        return tg.download_file(fid)
+
+                    return cm.get("part", 0), cache.get_or_fetch(fid, fetcher)
+
+                futures = [pool.submit(fetch_chunk, cm) for cm in needed]
+                results: list[tuple[int, bytes]] = []
+                for fut in futures:
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:
+                        log.error("read fetch failed for %s: %s", h.path, e)
+                        raise FuseOSError(errno.EIO)
+                with h.lock:
+                    for part, data in results:
+                        if part in h.downloaded_parts:
+                            continue
+                        h.tmp.seek(part * cs)
+                        h.tmp.write(data)
+                        h.downloaded_parts.add(part)
+
+        with h.lock:
+            h.tmp.seek(offset)
+            return h.tmp.read(nread)
 
     def write(self, path: str, data: bytes, offset: int, fh: int) -> int:
         path = _norm(path)
