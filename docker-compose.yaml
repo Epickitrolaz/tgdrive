@@ -1,0 +1,15 @@
+services:
+  tgdrive:
+    container_name: tgdrive
+    volumes:
+      - /media/tgdrive:/mnt/tgdrive:shared
+    env_file:
+      - .env
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    restart: always
+    image: tgdrive
