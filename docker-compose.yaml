@@ -2,14 +2,21 @@ services:
   tgdrive:
     container_name: tgdrive
     volumes:
-      - /media/tgdrive:/mnt/tgdrive:shared
+      - /media/tgdrive:/app/mount:shared
     env_file:
       - .env
     devices:
       - /dev/fuse
+    healthcheck:
+      test: ["CMD", "sh", "-c", "grep -q tgdrive /proc/mounts && pgrep -f 'python.*tgdrive'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     cap_add:
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
     restart: always
+    pull_policy: never
     image: tgdrive
